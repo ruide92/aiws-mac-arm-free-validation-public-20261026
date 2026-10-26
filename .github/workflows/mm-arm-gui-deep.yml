@@ -1,0 +1,153 @@
+name: mm-arm-gui-deep
+on:
+  workflow_dispatch:
+jobs:
+  deep:
+    runs-on: macos-14
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+    steps:
+      - name: Probe host
+        run: |
+          set -euxo pipefail
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+          node --version
+      - name: Download and mount DMG
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume" "$RUNNER_TEMP/mm/evidence"
+          gh release download "$RELEASE_TAG" --repo "$PRIVATE_REPO" --pattern "$DMG_NAME" --dir "$RUNNER_TEMP/mm"
+          test "$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          for app in "$RUNNER_TEMP/mm/volume"/*.app; do
+            name=$(basename "$app" .app)
+            ditto "$app" "$RUNNER_TEMP/mm/$name.app"
+            xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/$name.app" 2>/dev/null || true
+          done
+          echo '--- arch ---'
+          for b in "$RUNNER_TEMP/mm"/*.app/Contents/MacOS/*; do echo "$b"; file "$b"; lipo -archs "$b" 2>&1 || true; done | tee "$RUNNER_TEMP/mm/evidence/arch.txt"
+      - name: DSH model menu and main UI
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" --args --remote-debugging-port=9222 || true
+          sleep 12
+          cat > "$RUNNER_TEMP/mm/dsh-menu.cjs" <<'NODE'
+          const http = require('http');
+          const get = (url) => new Promise((resolve, reject) => { http.get(url, res => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject); });
+          const WS = globalThis.WebSocket || require('ws');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          function connect(t) {
+            const ws = new WS(t.webSocketDebuggerUrl);
+            const add = (e,h) => typeof ws.addEventListener === 'function' ? ws.addEventListener(e,h) : ws.on(e,h);
+            let id = 0; const pending = new Map();
+            add('message', raw => { const s = raw && raw.data !== undefined ? raw.data : raw; const m = JSON.parse(s.toString()); if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result); } });
+            const send = (method, params={}) => new Promise((resolve, reject) => { const n = ++id; pending.set(n,{resolve,reject}); ws.send(JSON.stringify({id:n,method,params})); });
+            const ready = new Promise((resolve,reject) => { add('open',resolve); add('error',reject); });
+            return { ws, async ev(expr) { await ready; const r = await send('Runtime.evaluate',{expression:expr,returnByValue:true,awaitPromise:true}); return r.result && r.result.value; } };
+          }
+          async function snap(label) {
+            const ts = (await get('http://127.0.0.1:9222/json/list')).filter(t => t.type === 'page');
+            console.log('TARGETS ' + label + '=' + JSON.stringify(ts.map(t => ({url:t.url,title:t.title}))));
+            for (const t of ts) {
+              try { const c = connect(t); const v = await c.ev(`JSON.stringify({title:document.title,url:location.href,text:document.body.innerText,buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.innerText,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder,value:i.value}))})`); console.log('SNAP ' + label + ' ' + t.url + '=' + v); c.ws.close(); } catch(e) { console.log('ERR ' + e.message); }
+            }
+          }
+          async function click(urlPart, text) {
+            const t = (await get('http://127.0.0.1:9222/json/list')).find(t => t.type === 'page' && t.url.includes(urlPart));
+            if (!t) return 'NO_TARGET';
+            const c = connect(t); const r = await c.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.includes(${JSON.stringify(text)}));if(!b)return 'NOT_FOUND';b.click();return 'CLICKED';})()`); c.ws.close(); return r;
+          }
+          (async () => {
+            await snap('BEFORE');
+            console.log('SETUP_LATER=' + await click('dsh-app://app/', 'Set up later'));
+            await sleep(3000);
+            await snap('MAIN');
+            console.log('SELECT_MODEL=' + await click('dsh-app://app/', 'Select model'));
+            await sleep(1000);
+            await snap('MODEL_MENU');
+            console.log('MORE=' + await click('dsh-app://app/', 'More'));
+            await sleep(700);
+            await snap('MORE_MENU');
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node "$RUNNER_TEMP/mm/dsh-menu.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/dsh-menu.log"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/dsh-model-menu.png" || true
+      - name: Hermes onboarding
+        if: always()
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/Hermes Agent.app" --args --remote-debugging-port=9223 || true
+          sleep 25
+          curl -sS --max-time 5 http://127.0.0.1:9223/json/list > "$RUNNER_TEMP/mm/evidence/hermes-targets.json" || true
+          cat "$RUNNER_TEMP/mm/evidence/hermes-targets.json"
+          cat > "$RUNNER_TEMP/mm/hermes.cjs" <<'NODE'
+          const http = require('http');
+          const get = (url) => new Promise((resolve, reject) => { http.get(url, res => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject); });
+          const WS = globalThis.WebSocket || require('ws');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          function connect(t) {
+            const ws = new WS(t.webSocketDebuggerUrl);
+            const add = (e,h) => typeof ws.addEventListener === 'function' ? ws.addEventListener(e,h) : ws.on(e,h);
+            let id = 0; const pending = new Map();
+            add('message', raw => { const s = raw && raw.data !== undefined ? raw.data : raw; const m = JSON.parse(s.toString()); if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result); } });
+            const send = (method, params={}) => new Promise((resolve, reject) => { const n = ++id; pending.set(n,{resolve,reject}); ws.send(JSON.stringify({id:n,method,params})); });
+            const ready = new Promise((resolve,reject) => { add('open',resolve); add('error',reject); });
+            return { ws, async ev(expr) { await ready; const r = await send('Runtime.evaluate',{expression:expr,returnByValue:true,awaitPromise:true}); return r.result && r.result.value; } };
+          }
+          async function snap(label) {
+            const ts = (await get('http://127.0.0.1:9223/json/list')).filter(t => t.type === 'page');
+            console.log('TARGETS ' + label + '=' + JSON.stringify(ts.map(t => ({url:t.url,title:t.title}))));
+            for (const t of ts) {
+              try { const c = connect(t); const v = await c.ev(`JSON.stringify({title:document.title,url:location.href,text:document.body.innerText,buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.innerText,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder,value:i.value}))})`); console.log('SNAP ' + label + ' ' + t.url + '=' + v); c.ws.close(); } catch(e) { console.log('ERR ' + e.message); }
+            }
+          }
+          (async () => {
+            await snap('BEFORE');
+            const ts = (await get('http://127.0.0.1:9223/json/list')).filter(t => t.type === 'page');
+            const t = ts[0];
+            if (!t) { console.log('NO_HERMES_TARGET'); return; }
+            const c = connect(t);
+            const fill = await c.ev(`(()=>{const i=document.querySelector('input[placeholder="Your name"]');if(!i)return 'NO_NAME_INPUT';const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(i,'Buyer QA');i.dispatchEvent(new Event('input',{bubbles:true}));return i.value;})()`);
+            console.log('NAME_FILL=' + fill);
+            const click = await c.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.trim()==='Continue');if(!b)return 'NO_CONTINUE';b.click();return 'CLICKED';})()`);
+            console.log('CONTINUE=' + click);
+            await sleep(2500);
+            await snap('AFTER_CONTINUE');
+            c.ws.close();
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node "$RUNNER_TEMP/mm/hermes.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/hermes-flow.log"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/hermes-after-onboarding.png" || true
+      - name: Quit and reopen
+        if: always()
+        run: |
+          set -uxo pipefail
+          osascript -e 'tell application "DeepSeek Harness" to quit' 2>&1 || true
+          osascript -e 'tell application "Hermes Agent" to quit' 2>&1 || true
+          sleep 5
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" || true
+          open -n "$RUNNER_TEMP/mm/Hermes Agent.app" || true
+          sleep 25
+          pgrep -af 'DeepSeek|Hermes' || true
+          screencapture -x "$RUNNER_TEMP/mm/evidence/reopen-both.png" || true
+          system_profiler SPUSBDataType > "$RUNNER_TEMP/mm/evidence/usb.txt" 2>&1 || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-gui-deep
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
