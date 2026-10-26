@@ -53,7 +53,8 @@ jobs:
             http.get(url, (res) => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject);
           });
           const WS = globalThis.WebSocket || require('ws');
-          async function main() {\n          const targets = await get('http://127.0.0.1:9222/json/list');
+          async function main() {
+          const targets = await get('http://127.0.0.1:9222/json/list');
           console.log('TARGETS=' + JSON.stringify(targets.map(t => ({id:t.id,type:t.type,url:t.url,title:t.title}))));
           const target = targets.find(t => t.type === 'page' && t.url.includes('welcome.html')) || targets.find(t => t.type === 'page');
           if (!target) throw new Error('no page target');
@@ -86,6 +87,8 @@ jobs:
           await sleep(1500);
           await snapshot('AFTER_WAIT');
           ws.close();
+          }
+          main().catch(e => { console.error(e); process.exit(1); });
           NODE
           cd "$RUNNER_TEMP/mm/cdp" && node probe.cjs 2>&1 | tee "$RUNNER_TEMP/mm/evidence/cdp-probe.log"
           screencapture -x "$RUNNER_TEMP/mm/evidence/after-cdp.png" || true
