@@ -1,0 +1,79 @@
+name: mm-arm-gui-validation
+on:
+  workflow_dispatch:
+jobs:
+  validate:
+    runs-on: macos-14
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+    steps:
+      - name: Probe Apple Silicon host
+        run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          sw_vers
+          system_profiler SPHardwareDataType | sed -n '1,40p'
+
+      - name: Download private MM payload
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm"
+          command -v gh
+          gh release download "$RELEASE_TAG" \
+            --repo "$PRIVATE_REPO" \
+            --pattern "$DMG_NAME" \
+            --dir "$RUNNER_TEMP/mm"
+          ls -lh "$RUNNER_TEMP/mm/$DMG_NAME"
+          actual=$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')
+          echo "actual_sha256=$actual"
+          test "$actual" = "$EXPECTED_SHA256"
+
+      - name: Mount and inventory DMG
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          find "$RUNNER_TEMP/mm/volume" -maxdepth 4 -print | sed -n '1,240p'
+          echo '--- apps ---'
+          find "$RUNNER_TEMP/mm/volume" -maxdepth 4 -name '*.app' -print
+
+      - name: Launch GUI and capture
+        run: |
+          set -uxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/evidence"
+          app=$(find "$RUNNER_TEMP/mm/volume" -maxdepth 4 -name '*.app' -print -quit)
+          echo "app=$app"
+          if [ -z "$app" ]; then echo 'NO_APP_FOUND'; exit 2; fi
+          ditto "$app" "$RUNNER_TEMP/mm/AIWS.app"
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/AIWS.app" || true
+          open "$RUNNER_TEMP/mm/AIWS.app" || echo "open_exit=$?"
+          sleep 20
+          pgrep -af 'AIWS|Hermes|DeepSeek|AI工作站' || true
+          osascript -e 'tell application "System Events" to get name of every process whose background only is false' 2>&1 || true
+          screencapture -x "$RUNNER_TEMP/mm/evidence/after-launch.png" || echo "screencapture_exit=$?"
+          ls -l "$RUNNER_TEMP/mm/evidence"
+          file "$RUNNER_TEMP/mm/evidence/after-launch.png" 2>/dev/null || true
+          log show --last 3m --style compact --predicate 'process == "AIWSStudio" OR process == "AI工作站"' 2>&1 | tail -200 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-gui-evidence
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+
+      - name: Detach DMG
+        if: always()
+        run: |
+          hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
