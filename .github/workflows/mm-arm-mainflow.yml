@@ -108,7 +108,6 @@ jobs:
             console.log('CLICK_SETUP_LATER=' + await clickOnWelcome('Set up later'));
             await sleep(5000);
             await snapshotAll('AFTER_SETUP_LATER');
-            screencapture('x');
           })().catch(e => { console.error(e); process.exit(1); });
           NODE
           node "$RUNNER_TEMP/mm/cdp-flow.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/mainflow-cdp.log"
