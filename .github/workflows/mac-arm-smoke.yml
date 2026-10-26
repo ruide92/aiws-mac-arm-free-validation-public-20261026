@@ -1,0 +1,34 @@
+name: mac-arm-smoke
+on:
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - name: Probe Apple Silicon host
+        run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          sw_vers
+          system_profiler SPHardwareDataType | sed -n '1,60p'
+      - name: Probe GUI session
+        run: |
+          set -uxo pipefail
+          mkdir -p artifacts
+          id
+          who
+          launchctl print gui/$(id -u) >/dev/null 2>&1; echo "GUI_DOMAIN=$?"
+          screencapture -x artifacts/smoke.png || echo "screencapture exit=$?"
+          ls -l artifacts || true
+          file artifacts/smoke.png 2>/dev/null || true
+          osascript -e 'tell application "Finder" to get name of every process' 2>&1 || true
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-arm-smoke
+          path: artifacts
+          if-no-files-found: warn
