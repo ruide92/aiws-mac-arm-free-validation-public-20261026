@@ -1,0 +1,101 @@
+name: mm-arm-cdp-probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: macos-14
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+    steps:
+      - name: Probe host
+        run: |
+          set -euxo pipefail
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+          node --version
+          node -e 'console.log("WebSocketType="+typeof WebSocket)'
+      - name: Download and mount DMG
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume" "$RUNNER_TEMP/mm/evidence" "$RUNNER_TEMP/mm/cdp"
+          gh release download "$RELEASE_TAG" --repo "$PRIVATE_REPO" --pattern "$DMG_NAME" --dir "$RUNNER_TEMP/mm"
+          test "$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          for app in "$RUNNER_TEMP/mm/volume"/*.app; do
+            name=$(basename "$app" .app)
+            ditto "$app" "$RUNNER_TEMP/mm/$name.app"
+            xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/$name.app" 2>/dev/null || true
+          done
+      - name: Launch DeepSeek with CDP
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" --args --remote-debugging-port=9222 || true
+          sleep 12
+          curl -sS --max-time 5 http://127.0.0.1:9222/json/list > "$RUNNER_TEMP/mm/evidence/targets.json" || true
+          cat "$RUNNER_TEMP/mm/evidence/targets.json"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/before-cdp.png" || true
+          if ! node -e 'process.exit(typeof WebSocket === "undefined" ? 1 : 0)'; then
+            npm install --prefix "$RUNNER_TEMP/mm/cdp" ws@8 --no-save --no-audit --no-fund
+            export NODE_PATH="$RUNNER_TEMP/mm/cdp/node_modules"
+          fi
+          cat > "$RUNNER_TEMP/mm/cdp/probe.cjs" <<'NODE'
+          const http = require('http');
+          const get = (url) => new Promise((resolve, reject) => {
+            http.get(url, (res) => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject);
+          });
+          const WS = globalThis.WebSocket || require('ws');
+          const targets = await get('http://127.0.0.1:9222/json/list');
+          console.log('TARGETS=' + JSON.stringify(targets.map(t => ({id:t.id,type:t.type,url:t.url,title:t.title}))));
+          const target = targets.find(t => t.type === 'page' && t.url.includes('welcome.html')) || targets.find(t => t.type === 'page');
+          if (!target) throw new Error('no page target');
+          const ws = new WS(target.webSocketDebuggerUrl);
+          let seq = 0;
+          const pending = new Map();
+          ws.on('message', (raw) => {
+            const msg = JSON.parse(raw.toString());
+            if (msg.id && pending.has(msg.id)) { const p = pending.get(msg.id); pending.delete(msg.id); msg.error ? p.reject(new Error(JSON.stringify(msg.error))) : p.resolve(msg.result); }
+          });
+          const send = (method, params={}) => new Promise((resolve, reject) => {
+            const id = ++seq; pending.set(id, {resolve, reject}); ws.send(JSON.stringify({id, method, params}));
+          });
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+          await send('Runtime.enable');
+          const evaluate = async (expression) => {
+            const r = await send('Runtime.evaluate', {expression, returnByValue: true, awaitPromise: true});
+            return r.result && r.result.value;
+          };
+          const snapshot = async (label) => {
+            const value = await evaluate(`JSON.stringify({title:document.title,url:location.href,text:document.body.innerText,buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.innerText,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({tag:i.tagName,type:i.type,placeholder:i.placeholder,value:i.value}))})`);
+            console.log('SNAPSHOT ' + label + '=' + value);
+          };
+          await snapshot('BEFORE');
+          const clicked = await evaluate(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.includes('Add API Key'));if(!b)return 'NOT_FOUND';b.click();return 'CLICKED';})()`);
+          console.log('CLICK=' + clicked);
+          await sleep(1200);
+          await snapshot('AFTER_CLICK');
+          await sleep(1500);
+          await snapshot('AFTER_WAIT');
+          ws.close();
+          NODE
+          cd "$RUNNER_TEMP/mm/cdp" && node probe.cjs 2>&1 | tee "$RUNNER_TEMP/mm/evidence/cdp-probe.log"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/after-cdp.png" || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-cdp-probe
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
