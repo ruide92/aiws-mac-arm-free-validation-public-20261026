@@ -1,0 +1,207 @@
+name: mm-arm-real-model
+on:
+  workflow_dispatch:
+jobs:
+  real-model:
+    runs-on: macos-14
+    timeout-minutes: 45
+    environment: mm-api-test
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+    steps:
+      - name: Probe host
+        run: |
+          set -euo pipefail
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+      - name: DeepSeek API smoke
+        env:
+          MM_TEST_API_KEY: ${{ secrets.MM_TEST_API_KEY }}
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $MM_TEST_API_KEY" https://api.deepseek.com/models)
+          echo "DEEPSEEK_MODELS_HTTP=$code"
+          test "$code" = "200"
+      - name: Download and mount DMG
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume" "$RUNNER_TEMP/mm/evidence"
+          gh release download "$RELEASE_TAG" --repo "$PRIVATE_REPO" --pattern "$DMG_NAME" --dir "$RUNNER_TEMP/mm"
+          test "$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          for app in "$RUNNER_TEMP/mm/volume"/*.app; do
+            name=$(basename "$app" .app)
+            ditto "$app" "$RUNNER_TEMP/mm/$name.app"
+            xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/$name.app" 2>/dev/null || true
+          done
+          printf 'buyer file content: hello from real ARM model test\n' > "$RUNNER_TEMP/mm/evidence/buyer-file.txt"
+      - name: DSH real model and file
+        continue-on-error: true
+        env:
+          MM_TEST_API_KEY: ${{ secrets.MM_TEST_API_KEY }}
+        run: |
+          set -euo pipefail
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" --args --remote-debugging-port=9222 || true
+          sleep 25
+          cat > "$RUNNER_TEMP/mm/dsh-real.cjs" <<'NODE'
+          const http = require('http');
+          const fs = require('fs');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const KEY = process.env.MM_TEST_API_KEY;
+          if (!KEY) throw new Error('MM_TEST_API_KEY missing');
+          const get = (url) => new Promise((resolve, reject) => {
+            http.get(url, res => { let s = ''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject);
+          });
+          const WS = globalThis.WebSocket || require('ws');
+          function connect(t) {
+            const ws = new WS(t.webSocketDebuggerUrl);
+            const add = (e, h) => typeof ws.addEventListener === 'function' ? ws.addEventListener(e, h) : ws.on(e, h);
+            let id = 0; const pending = new Map();
+            add('message', raw => {
+              const s = raw && raw.data !== undefined ? raw.data : raw;
+              const m = JSON.parse(s.toString());
+              if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result); }
+            });
+            const send = (method, params = {}) => new Promise((resolve, reject) => {
+              const n = ++id; pending.set(n, { resolve, reject }); ws.send(JSON.stringify({ id: n, method, params }));
+            });
+            const ready = new Promise((resolve, reject) => { add('open', resolve); add('error', reject); });
+            return {
+              ws, send,
+              async ev(expr) { await ready; const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); return r.result && r.result.value; },
+              async raw(expr) { await ready; return send('Runtime.evaluate', { expression: expr, returnByValue: false }); }
+            };
+          }
+          const targets = async () => (await get('http://127.0.0.1:9222/json/list')).filter(t => t.type === 'page');
+          async function snap(c, label) {
+            const v = await c.ev(`JSON.stringify({url:location.href,text:document.body.innerText.slice(0,5000),buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.innerText,aria:b.getAttribute('aria-label'),title:b.title,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder,valueLength:(i.value||'').length}))})`);
+            console.log('SNAP ' + label + '=' + v);
+          }
+          async function clickText(c, label) {
+            return c.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.trim()===${JSON.stringify(label)}&&!x.disabled);if(!b)return 'NOT_FOUND';b.click();return 'CLICKED';})()`);
+          }
+          (async () => {
+            let ts = await targets();
+            console.log('TARGETS=' + JSON.stringify(ts.map(t => ({url:t.url,title:t.title}))));
+            const welcome = ts.find(t => t.url.includes('welcome.html'));
+            if (!welcome) throw new Error('no welcome target');
+            const c = connect(welcome);
+            await snap(c, 'WELCOME');
+
+            const add = await clickText(c, 'Add API Key');
+            console.log('ADD_API_KEY=' + add);
+            await sleep(1200);
+            await snap(c, 'API_FORM');
+
+            const filled = await c.ev(`(()=>{const i=document.querySelector('input[type=password]');if(!i)return 'NO_PASSWORD_INPUT';const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(i,${JSON.stringify(KEY)});i.dispatchEvent(new Event('input',{bubbles:true}));i.dispatchEvent(new Event('change',{bubbles:true}));i.focus();return 'FILLED';})()`);
+            console.log('FILL_API_KEY=' + filled);
+            await sleep(800);
+            await snap(c, 'AFTER_FILL');
+            const save = await clickText(c, 'Save and continue');
+            console.log('SAVE=' + save);
+            await sleep(10000);
+            await snap(c, 'AFTER_SAVE');
+            c.ws.close();
+
+            ts = await targets();
+            const main = ts.find(t => t.url === 'dsh-app://app/') || ts.find(t => t.url.includes('dsh-app'));
+            if (!main) throw new Error('no main target');
+            const m = connect(main);
+            await snap(m, 'MAIN');
+
+            const modelButton = await clickText(m, 'Select model');
+            console.log('MODEL_BUTTON=' + modelButton);
+            await sleep(1500);
+            await snap(m, 'MODEL_MENU');
+
+            const choose = await m.ev(`(()=>{const bs=Array.from(document.querySelectorAll('button')).filter(b=>!b.disabled);const b=bs.find(x=>/deepseek|chat|model/i.test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));if(!b)return 'NO_MODEL_BUTTON';b.click();return 'CLICKED:'+b.innerText;})()`);
+            console.log('MODEL_CHOOSE=' + choose);
+            await sleep(1500);
+
+            const fileInput = await m.raw(`document.querySelector('input[type=file]')`);
+            if (fileInput.result && fileInput.result.objectId) {
+              await m.send('DOM.setFileInputFiles', { files: [process.env.RUNNER_TEMP + '/mm/evidence/buyer-file.txt'], objectId: fileInput.result.objectId });
+              console.log('FILE_ATTACH=SENT');
+            } else {
+              console.log('FILE_ATTACH=NO_INPUT');
+            }
+            await sleep(1500);
+            await snap(m, 'AFTER_FILE');
+
+            const inputInfo = await m.ev(`(()=>{const el=document.querySelector('[contenteditable="true"],textarea,[role="textbox"]');if(!el)return 'NO_CHAT_INPUT';return JSON.stringify({tag:el.tagName,role:el.getAttribute('role'),placeholder:el.getAttribute('placeholder'),aria:el.getAttribute('aria-label'),html:el.outerHTML.slice(0,600)});})()`);
+            console.log('CHAT_INPUT=' + inputInfo);
+            const focus = await m.ev(`(()=>{const el=document.querySelector('[contenteditable="true"],textarea,[role="textbox"]');if(!el)return 'NO_INPUT';el.focus();return 'FOCUSED';})()`);
+            console.log('CHAT_FOCUS=' + focus);
+            await m.send('Input.insertText', { text: 'Reply with exactly READY and nothing else.' });
+            await sleep(800);
+            await snap(m, 'AFTER_TYPE');
+            const sendInfo = await m.ev(`JSON.stringify(Array.from(document.querySelectorAll('button')).map(b=>({text:(b.innerText||'').slice(0,80),aria:b.getAttribute('aria-label'),title:b.title,disabled:b.disabled,html:b.outerHTML.slice(0,260)})).slice(-12))`);
+            console.log('SEND_BUTTONS=' + sendInfo);
+            await m.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+            await m.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+            console.log('ENTER_SENT');
+            await sleep(3000);
+            const clickedSend = await m.ev(`(()=>{const bs=Array.from(document.querySelectorAll('button')).filter(b=>!b.disabled);const b=bs.find(x=>/send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.title||'')))||null;if(!b)return 'NO_SEND_BUTTON';b.click();return 'CLICKED_SEND';})()`);
+            console.log('SEND_FALLBACK=' + clickedSend);
+
+            let last = '';
+            for (let i = 0; i < 18; i++) {
+              await sleep(5000);
+              const t = await m.ev('document.body.innerText');
+              if (t !== last) { last = t; console.log('POLL=' + i + ' LEN=' + t.length); }
+              if (/READY/.test(t) && !/Reply with exactly READY/.test(t)) break;
+            }
+            console.log('CHAT_BODY=' + JSON.stringify(last.slice(-4000)));
+            fs.writeFileSync(process.env.RUNNER_TEMP + '/mm/evidence/result.json', JSON.stringify({ api: 'DeepSeek official', model: 'deepseek-chat', chatSeen: /READY/.test(last), chatTail: last.slice(-1500), fileAttachSent: !!(fileInput.result && fileInput.result.objectId) }, null, 2));
+            m.ws.close();
+          })().catch(e => { console.error('DSH_ERROR=' + e.message); process.exit(1); });
+          NODE
+          set +e
+          node "$RUNNER_TEMP/mm/dsh-real.cjs" > "$RUNNER_TEMP/mm/evidence/dsh-real.log" 2>&1
+          echo "DSH_NODE_EXIT=$?"
+          set -e
+          screencapture -x "$RUNNER_TEMP/mm/evidence/dsh-chat.png" || true
+          osascript -e 'tell application "DeepSeek Harness" to quit' 2>&1 || true
+          sleep 5
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" || true
+          sleep 20
+          screencapture -x "$RUNNER_TEMP/mm/evidence/dsh-reopen.png" || true
+          cat > "$RUNNER_TEMP/mm/reopen.cjs" <<'NODE'
+          const http = require('http');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const get = (url) => new Promise((resolve, reject) => { http.get(url, res => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject); });
+          const WS = globalThis.WebSocket || require('ws');
+          function connect(t) {
+            const ws = new WS(t.webSocketDebuggerUrl);
+            const add = (e,h) => typeof ws.addEventListener === 'function' ? ws.addEventListener(e,h) : ws.on(e,h);
+            let id=0; const pending=new Map();
+            add('message', raw => { const s=raw&&raw.data!==undefined?raw.data:raw; const m=JSON.parse(s.toString()); if(m.id&&pending.has(m.id)){const p=pending.get(m.id);pending.delete(m.id);m.error?p.reject(new Error(JSON.stringify(m.error))):p.resolve(m.result);} });
+            const send=(method,params={})=>new Promise((resolve,reject)=>{const n=++id;pending.set(n,{resolve,reject});ws.send(JSON.stringify({id:n,method,params}));});
+            const ready=new Promise((resolve,reject)=>{add('open',resolve);add('error',reject);});
+            return { ws, async ev(expr){await ready;const r=await send('Runtime.evaluate',{expression:expr,returnByValue:true,awaitPromise:true});return r.result&&r.result.value;} };
+          }
+          (async()=>{const ts=(await get('http://127.0.0.1:9222/json/list')).filter(t=>t.type==='page');console.log('REOPEN_TARGETS='+JSON.stringify(ts.map(t=>({url:t.url,title:t.title}))));for(const t of ts){const c=connect(t);const v=await c.ev(`JSON.stringify({url:location.href,text:document.body.innerText.slice(0,3000)})`);console.log('REOPEN '+t.url+'='+v);c.ws.close();}})().catch(e=>{console.error('REOPEN_ERROR='+e.message);process.exit(1);});
+          NODE
+          set +e
+          node "$RUNNER_TEMP/mm/reopen.cjs" > "$RUNNER_TEMP/mm/evidence/dsh-reopen.log" 2>&1
+          echo "REOPEN_NODE_EXIT=$?"
+          set -e
+          system_profiler SPUSBDataType > "$RUNNER_TEMP/mm/evidence/usb.txt" 2>&1 || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-real-model
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
