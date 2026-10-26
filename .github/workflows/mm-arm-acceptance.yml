@@ -1,0 +1,144 @@
+name: mm-arm-acceptance
+on:
+  workflow_dispatch:
+jobs:
+  acceptance:
+    runs-on: macos-14
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+    steps:
+      - name: Probe host
+        run: |
+          set -euxo pipefail
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+      - name: Download and mount DMG
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume" "$RUNNER_TEMP/mm/evidence"
+          gh release download "$RELEASE_TAG" --repo "$PRIVATE_REPO" --pattern "$DMG_NAME" --dir "$RUNNER_TEMP/mm"
+          test "$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          for app in "$RUNNER_TEMP/mm/volume"/*.app; do
+            name=$(basename "$app" .app)
+            ditto "$app" "$RUNNER_TEMP/mm/$name.app"
+            xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/$name.app" 2>/dev/null || true
+          done
+          printf 'buyer file content: hello from free ARM GUI acceptance\n' > "$RUNNER_TEMP/mm/evidence/buyer-file.txt"
+      - name: DSH setup and file attach
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" --args --remote-debugging-port=9222 || true
+          sleep 12
+          cat > "$RUNNER_TEMP/mm/accept.cjs" <<'NODE'
+          const http = require('http');
+          const get = (url) => new Promise((resolve, reject) => { http.get(url, res => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject); });
+          const WS = globalThis.WebSocket || require('ws');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          function connect(t) {
+            const ws = new WS(t.webSocketDebuggerUrl);
+            const add = (e,h) => typeof ws.addEventListener === 'function' ? ws.addEventListener(e,h) : ws.on(e,h);
+            let id = 0; const pending = new Map();
+            add('message', raw => { const s = raw && raw.data !== undefined ? raw.data : raw; const m = JSON.parse(s.toString()); if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result); } });
+            const send = (method, params={}) => new Promise((resolve, reject) => { const n = ++id; pending.set(n,{resolve,reject}); ws.send(JSON.stringify({id:n,method,params})); });
+            const ready = new Promise((resolve,reject) => { add('open',resolve); add('error',reject); });
+            return { ws, send, async ev(expr) { await ready; const r = await send('Runtime.evaluate',{expression:expr,returnByValue:true,awaitPromise:true}); return r.result && r.result.value; }, async raw(expr) { await ready; return send('Runtime.evaluate',{expression:expr,returnByValue:false}); } };
+          }
+          async function targets() { return (await get('http://127.0.0.1:9222/json/list')).filter(t => t.type === 'page'); }
+          async function snap(label) {
+            const ts = await targets();
+            console.log('TARGETS ' + label + '=' + JSON.stringify(ts.map(t => ({url:t.url,title:t.title}))));
+            for (const t of ts) {
+              try { const c = connect(t); const v = await c.ev(`JSON.stringify({title:document.title,url:location.href,text:document.body.innerText,buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.innerText,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder,value:i.value}))})`); console.log('SNAP ' + label + ' ' + t.url + '=' + v); c.ws.close(); } catch(e) { console.log('ERR ' + e.message); }
+            }
+          }
+          (async () => {
+            const ts = await targets();
+            const w = ts.find(t => t.url.includes('welcome.html'));
+            if (!w) throw new Error('no welcome target');
+            const c = connect(w);
+            const click = await c.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.includes('Set up later'));if(!b)return 'NOT_FOUND';b.click();return 'CLICKED';})()`);
+            console.log('SETUP_LATER=' + click);
+            await sleep(3000);
+            await snap('AFTER_SETUP_LATER');
+            const main = (await targets()).find(t => t.url === 'dsh-app://app/');
+            if (main) {
+              const m = connect(main);
+              const fileInput = await m.raw(`document.querySelector('input[type=file]')`);
+              if (fileInput.result && fileInput.result.objectId) {
+                await m.send('DOM.setFileInputFiles', {files: [process.env.RUNNER_TEMP + '/mm/evidence/buyer-file.txt'], objectId: fileInput.result.objectId});
+                console.log('FILE_ATTACH=SENT');
+              } else { console.log('FILE_ATTACH=NO_INPUT'); }
+              await sleep(1500);
+              const text = await m.ev(`document.body.innerText`);
+              console.log('MAIN_TEXT_AFTER_FILE=' + JSON.stringify(text));
+              m.ws.close();
+            } else { console.log('FILE_ATTACH=NO_MAIN_TARGET'); }
+            c.ws.close();
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node "$RUNNER_TEMP/mm/accept.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/accept-cdp.log"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/dsh-after-setup-file.png" || true
+          osascript -e 'tell application "DeepSeek Harness" to quit' 2>&1 || true
+          sleep 5
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" || true
+          sleep 15
+          screencapture -x "$RUNNER_TEMP/mm/evidence/dsh-reopen-after-setup.png" || true
+          pgrep -af 'DeepSeek' || true
+      - name: Hermes skip setup
+        if: always()
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/Hermes Agent.app" --args --remote-debugging-port=9223 || true
+          sleep 30
+          cat > "$RUNNER_TEMP/mm/hermes-skip.cjs" <<'NODE'
+          const http = require('http');
+          const get = (url) => new Promise((resolve, reject) => { http.get(url, res => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject); });
+          const WS = globalThis.WebSocket || require('ws');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          function connect(t) {
+            const ws = new WS(t.webSocketDebuggerUrl);
+            const add = (e,h) => typeof ws.addEventListener === 'function' ? ws.addEventListener(e,h) : ws.on(e,h);
+            let id = 0; const pending = new Map();
+            add('message', raw => { const s = raw && raw.data !== undefined ? raw.data : raw; const m = JSON.parse(s.toString()); if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result); } });
+            const send = (method, params={}) => new Promise((resolve, reject) => { const n = ++id; pending.set(n,{resolve,reject}); ws.send(JSON.stringify({id:n,method,params})); });
+            const ready = new Promise((resolve,reject) => { add('open',resolve); add('error',reject); });
+            return { ws, async ev(expr) { await ready; const r = await send('Runtime.evaluate',{expression:expr,returnByValue:true,awaitPromise:true}); return r.result && r.result.value; } };
+          }
+          (async () => {
+            const ts = (await get('http://127.0.0.1:9223/json/list')).filter(t => t.type === 'page');
+            console.log('TARGETS=' + JSON.stringify(ts.map(t => ({url:t.url,title:t.title}))));
+            if (!ts.length) { console.log('NO_TARGET'); return; }
+            const c = connect(ts[0]);
+            const before = await c.ev(`document.body.innerText`);
+            console.log('BEFORE=' + JSON.stringify(before));
+            const click = await c.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.trim()==='Skip setup');if(!b)return 'NO_SKIP';b.click();return 'CLICKED';})()`);
+            console.log('SKIP=' + click);
+            await sleep(2500);
+            const after = await c.ev(`JSON.stringify({text:document.body.innerText,buttons:Array.from(document.querySelectorAll('button')).map(b=>b.innerText),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder}))})`);
+            console.log('AFTER=' + after);
+            c.ws.close();
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node "$RUNNER_TEMP/mm/hermes-skip.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/hermes-skip.log"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/hermes-after-skip.png" || true
+          system_profiler SPUSBDataType > "$RUNNER_TEMP/mm/evidence/usb.txt" 2>&1 || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-acceptance
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
