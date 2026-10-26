@@ -1,0 +1,103 @@
+name: mm-arm-hermes-task
+on:
+  workflow_dispatch:
+jobs:
+  hermes:
+    runs-on: macos-14
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+    steps:
+      - name: Probe host
+        run: |
+          set -euxo pipefail
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+      - name: Download and mount DMG
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume" "$RUNNER_TEMP/mm/evidence"
+          gh release download "$RELEASE_TAG" --repo "$PRIVATE_REPO" --pattern "$DMG_NAME" --dir "$RUNNER_TEMP/mm"
+          test "$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          for app in "$RUNNER_TEMP/mm/volume"/*.app; do
+            name=$(basename "$app" .app)
+            ditto "$app" "$RUNNER_TEMP/mm/$name.app"
+            xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/$name.app" 2>/dev/null || true
+          done
+      - name: Hermes task
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/Hermes Agent.app" --args --remote-debugging-port=9223 || true
+          sleep 30
+          cat > "$RUNNER_TEMP/mm/hermes-task.cjs" <<'NODE'
+          const http = require('http');
+          const get = (url) => new Promise((resolve, reject) => { http.get(url, res => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject); });
+          const WS = globalThis.WebSocket || require('ws');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          function connect(t) {
+            const ws = new WS(t.webSocketDebuggerUrl);
+            const add = (e,h) => typeof ws.addEventListener === 'function' ? ws.addEventListener(e,h) : ws.on(e,h);
+            let id = 0; const pending = new Map();
+            add('message', raw => { const s = raw && raw.data !== undefined ? raw.data : raw; const m = JSON.parse(s.toString()); if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result); } });
+            const send = (method, params={}) => new Promise((resolve, reject) => { const n = ++id; pending.set(n,{resolve,reject}); ws.send(JSON.stringify({id:n,method,params})); });
+            const ready = new Promise((resolve,reject) => { add('open',resolve); add('error',reject); });
+            return { ws, send, async ev(expr) { await ready; const r = await send('Runtime.evaluate',{expression:expr,returnByValue:true,awaitPromise:true}); return r.result && r.result.value; } };
+          }
+          async function snapshot(c, label) {
+            const v = await c.ev(`JSON.stringify({text:document.body.innerText,buttons:Array.from(document.querySelectorAll('button')).map((b,i)=>({i,text:b.innerText,aria:b.getAttribute('aria-label'),title:b.title,disabled:b.disabled,html:b.outerHTML.slice(0,260)})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder,value:i.value}))})`);
+            console.log(label + '=' + v);
+          }
+          (async () => {
+            const ts = (await get('http://127.0.0.1:9223/json/list')).filter(t => t.type === 'page');
+            console.log('TARGETS=' + JSON.stringify(ts.map(t => ({url:t.url,title:t.title}))));
+            if (!ts.length) throw new Error('no target');
+            const c = connect(ts[0]);
+            await snapshot(c, 'BEFORE');
+            const skip = await c.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.trim()==='Skip setup');if(!b)return 'NO_SKIP';b.click();return 'CLICKED';})()`);
+            console.log('SKIP=' + skip);
+            await sleep(5000);
+            await snapshot(c, 'AFTER_SKIP');
+            const info = await c.ev(`(()=>{const t=document.querySelector('textarea');if(!t)return 'NO_TEXTAREA';let p=t;for(let i=0;i<4&&p;i++)p=p.parentElement;return p?p.outerHTML.slice(0,4000):'NO_PARENT';})()`);
+            console.log('INPUT_AREA=' + JSON.stringify(info));
+            const fill = await c.ev(`(()=>{const t=document.querySelector('textarea');if(!t)return 'NO_TEXTAREA';const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;s.call(t,'Reply with exactly READY and nothing else.');t.dispatchEvent(new Event('input',{bubbles:true}));t.focus();return t.value;})()`);
+            console.log('FILL=' + JSON.stringify(fill));
+            await sleep(700);
+            await snapshot(c, 'AFTER_FILL');
+            const send = await c.ev(`(()=>{const ts=Array.from(document.querySelectorAll('button'));const b=ts.find(x=>{const a=(x.getAttribute('aria-label')||'')+' '+(x.title||'')+' '+(x.innerText||'');return /send|submit|arrow/i.test(a)&&!x.disabled;})||ts[ts.length-1];if(!b)return 'NO_BUTTON';b.click();return 'CLICKED:'+b.outerHTML.slice(0,400);})()`);
+            console.log('SEND=' + send);
+            await sleep(15000);
+            await snapshot(c, 'AFTER_15S');
+            await sleep(30000);
+            await snapshot(c, 'AFTER_45S');
+            c.ws.close();
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node "$RUNNER_TEMP/mm/hermes-task.cjs" > "$RUNNER_TEMP/mm/evidence/hermes-task.log" 2>&1; echo NODE_EXIT=$?
+          cat "$RUNNER_TEMP/mm/evidence/hermes-task.log"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/hermes-task.png" || true
+          osascript -e 'tell application "Hermes Agent" to quit' 2>&1 || true
+          sleep 5
+          open -n "$RUNNER_TEMP/mm/Hermes Agent.app" || true
+          sleep 30
+          screencapture -x "$RUNNER_TEMP/mm/evidence/hermes-reopen.png" || true
+          pgrep -af 'Hermes' || true
+          system_profiler SPUSBDataType > "$RUNNER_TEMP/mm/evidence/usb.txt" 2>&1 || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-hermes-task
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
