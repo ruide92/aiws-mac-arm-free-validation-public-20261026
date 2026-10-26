@@ -82,11 +82,20 @@ jobs:
           }
           const targets = async () => (await get('http://127.0.0.1:9222/json/list')).filter(t => t.type === 'page');
           async function snap(c, label) {
-            const v = await c.ev(`JSON.stringify({url:location.href,text:document.body.innerText.slice(0,5000),buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.innerText,aria:b.getAttribute('aria-label'),title:b.title,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder,valueLength:(i.value||'').length}))})`);
+            const v = await c.ev(`JSON.stringify({url:location.href,text:document.body.innerText.slice(0,5000),buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:(b.innerText||'').slice(0,100),aria:b.getAttribute('aria-label'),title:b.title,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({type:i.type,placeholder:i.placeholder,valueLength:(i.value||'').length}))})`);
             console.log('SNAP ' + label + '=' + v);
           }
           async function clickText(c, label) {
             return c.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.trim()===${JSON.stringify(label)}&&!x.disabled);if(!b)return 'NOT_FOUND';b.click();return 'CLICKED';})()`);
+          }
+          async function waitMain() {
+            for (let i = 0; i < 30; i++) {
+              const ts = await targets();
+              const main = ts.find(t => t.url === 'dsh-app://app/') || ts.find(t => t.url.includes('dsh-app'));
+              if (main) return main;
+              await sleep(1000);
+            }
+            throw new Error('no main target after save');
           }
           (async () => {
             let ts = await targets();
@@ -95,40 +104,24 @@ jobs:
             if (!welcome) throw new Error('no welcome target');
             const c = connect(welcome);
             await snap(c, 'WELCOME');
-
-            const add = await clickText(c, 'Add API Key');
-            console.log('ADD_API_KEY=' + add);
+            console.log('ADD_API_KEY=' + await clickText(c, 'Add API Key'));
             await sleep(1200);
             await snap(c, 'API_FORM');
-
             const filled = await c.ev(`(()=>{const i=document.querySelector('input[type=password]');if(!i)return 'NO_PASSWORD_INPUT';const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(i,${JSON.stringify(KEY)});i.dispatchEvent(new Event('input',{bubbles:true}));i.dispatchEvent(new Event('change',{bubbles:true}));i.focus();return 'FILLED';})()`);
             console.log('FILL_API_KEY=' + filled);
             await sleep(800);
             await snap(c, 'AFTER_FILL');
-            const save = await clickText(c, 'Save and continue');
-            console.log('SAVE=' + save);
-            await sleep(10000);
-            await snap(c, 'AFTER_SAVE');
-            c.ws.close();
-
-            ts = await targets();
-            const main = ts.find(t => t.url === 'dsh-app://app/') || ts.find(t => t.url.includes('dsh-app'));
-            if (!main) throw new Error('no main target');
-            const m = connect(main);
+            console.log('SAVE=' + await clickText(c, 'Save and continue'));
+            await sleep(12000);
+            try { c.ws.close(); } catch (e) {}
+            const m = connect(await waitMain());
             await snap(m, 'MAIN');
 
-            const modelButton = await clickText(m, 'Select model');
-            console.log('MODEL_BUTTON=' + modelButton);
-            await sleep(1500);
-            await snap(m, 'MODEL_MENU');
-
-            const choose = await m.ev(`(()=>{const bs=Array.from(document.querySelectorAll('button')).filter(b=>!b.disabled);const b=bs.find(x=>/deepseek|chat|model/i.test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));if(!b)return 'NO_MODEL_BUTTON';b.click();return 'CLICKED:'+b.innerText;})()`);
-            console.log('MODEL_CHOOSE=' + choose);
-            await sleep(1500);
-
             const fileInput = await m.raw(`document.querySelector('input[type=file]')`);
+            let fileSent = false;
             if (fileInput.result && fileInput.result.objectId) {
               await m.send('DOM.setFileInputFiles', { files: [process.env.RUNNER_TEMP + '/mm/evidence/buyer-file.txt'], objectId: fileInput.result.objectId });
+              fileSent = true;
               console.log('FILE_ATTACH=SENT');
             } else {
               console.log('FILE_ATTACH=NO_INPUT');
@@ -136,31 +129,32 @@ jobs:
             await sleep(1500);
             await snap(m, 'AFTER_FILE');
 
-            const inputInfo = await m.ev(`(()=>{const el=document.querySelector('[contenteditable="true"],textarea,[role="textbox"]');if(!el)return 'NO_CHAT_INPUT';return JSON.stringify({tag:el.tagName,role:el.getAttribute('role'),placeholder:el.getAttribute('placeholder'),aria:el.getAttribute('aria-label'),html:el.outerHTML.slice(0,600)});})()`);
-            console.log('CHAT_INPUT=' + inputInfo);
-            const focus = await m.ev(`(()=>{const el=document.querySelector('[contenteditable="true"],textarea,[role="textbox"]');if(!el)return 'NO_INPUT';el.focus();return 'FOCUSED';})()`);
+            const chatInfo = await m.ev(`JSON.stringify(Array.from(document.querySelectorAll('[contenteditable="true"],textarea,[role="textbox"]')).map(e=>({tag:e.tagName,role:e.getAttribute('role'),placeholder:e.getAttribute('placeholder'),aria:e.getAttribute('aria-label'),ce:e.getAttribute('contenteditable'),html:e.outerHTML.slice(0,500)})))`);
+            console.log('CHAT_INPUTS=' + chatInfo);
+            const focus = await m.ev(`(()=>{const es=Array.from(document.querySelectorAll('[contenteditable="true"],textarea,[role="textbox"]'));const e=es.find(x=>x.getAttribute('contenteditable')==='true')||es.find(x=>x.tagName==='TEXTAREA')||es[0];if(!e)return 'NO_INPUT';e.focus();return 'FOCUSED:'+e.tagName;})()`);
             console.log('CHAT_FOCUS=' + focus);
-            await m.send('Input.insertText', { text: 'Reply with exactly READY and nothing else.' });
+            await m.send('Input.insertText', { text: 'What is the capital of France? Reply with one word.' });
             await sleep(800);
             await snap(m, 'AFTER_TYPE');
-            const sendInfo = await m.ev(`JSON.stringify(Array.from(document.querySelectorAll('button')).map(b=>({text:(b.innerText||'').slice(0,80),aria:b.getAttribute('aria-label'),title:b.title,disabled:b.disabled,html:b.outerHTML.slice(0,260)})).slice(-12))`);
-            console.log('SEND_BUTTONS=' + sendInfo);
+            const sendButtons = await m.ev(`JSON.stringify(Array.from(document.querySelectorAll('button')).map(b=>({text:(b.innerText||'').slice(0,80),aria:b.getAttribute('aria-label'),title:b.title,disabled:b.disabled,html:b.outerHTML.slice(0,260)})).slice(-15))`);
+            console.log('SEND_BUTTONS=' + sendButtons);
             await m.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
             await m.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
             console.log('ENTER_SENT');
-            await sleep(3000);
-            const clickedSend = await m.ev(`(()=>{const bs=Array.from(document.querySelectorAll('button')).filter(b=>!b.disabled);const b=bs.find(x=>/send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.title||'')))||null;if(!b)return 'NO_SEND_BUTTON';b.click();return 'CLICKED_SEND';})()`);
-            console.log('SEND_FALLBACK=' + clickedSend);
+            await sleep(2500);
+            const clicked = await m.ev(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>!x.disabled && /send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.title||'')));if(!b)return 'NO_SEND_BUTTON';b.click();return 'CLICKED_SEND';})()`);
+            console.log('SEND_FALLBACK=' + clicked);
 
             let last = '';
             for (let i = 0; i < 18; i++) {
               await sleep(5000);
               const t = await m.ev('document.body.innerText');
               if (t !== last) { last = t; console.log('POLL=' + i + ' LEN=' + t.length); }
-              if (/READY/.test(t) && !/Reply with exactly READY/.test(t)) break;
+              if (/paris/i.test(t)) break;
             }
             console.log('CHAT_BODY=' + JSON.stringify(last.slice(-4000)));
-            fs.writeFileSync(process.env.RUNNER_TEMP + '/mm/evidence/result.json', JSON.stringify({ api: 'DeepSeek official', model: 'deepseek-chat', chatSeen: /READY/.test(last), chatTail: last.slice(-1500), fileAttachSent: !!(fileInput.result && fileInput.result.objectId) }, null, 2));
+            const chatSeen = /paris/i.test(last);
+            fs.writeFileSync(process.env.RUNNER_TEMP + '/mm/evidence/result.json', JSON.stringify({ api: 'DeepSeek official', model: 'deepseek-chat', chatSeen, chatTail: last.slice(-2000), fileAttachSent: fileSent }, null, 2));
             m.ws.close();
           })().catch(e => { console.error('DSH_ERROR=' + e.message); process.exit(1); });
           NODE
@@ -171,12 +165,11 @@ jobs:
           screencapture -x "$RUNNER_TEMP/mm/evidence/dsh-chat.png" || true
           osascript -e 'tell application "DeepSeek Harness" to quit' 2>&1 || true
           sleep 5
-          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" || true
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" --args --remote-debugging-port=9223 || true
           sleep 20
           screencapture -x "$RUNNER_TEMP/mm/evidence/dsh-reopen.png" || true
           cat > "$RUNNER_TEMP/mm/reopen.cjs" <<'NODE'
           const http = require('http');
-          const sleep = ms => new Promise(r => setTimeout(r, ms));
           const get = (url) => new Promise((resolve, reject) => { http.get(url, res => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject); });
           const WS = globalThis.WebSocket || require('ws');
           function connect(t) {
@@ -188,7 +181,7 @@ jobs:
             const ready=new Promise((resolve,reject)=>{add('open',resolve);add('error',reject);});
             return { ws, async ev(expr){await ready;const r=await send('Runtime.evaluate',{expression:expr,returnByValue:true,awaitPromise:true});return r.result&&r.result.value;} };
           }
-          (async()=>{const ts=(await get('http://127.0.0.1:9222/json/list')).filter(t=>t.type==='page');console.log('REOPEN_TARGETS='+JSON.stringify(ts.map(t=>({url:t.url,title:t.title}))));for(const t of ts){const c=connect(t);const v=await c.ev(`JSON.stringify({url:location.href,text:document.body.innerText.slice(0,3000)})`);console.log('REOPEN '+t.url+'='+v);c.ws.close();}})().catch(e=>{console.error('REOPEN_ERROR='+e.message);process.exit(1);});
+          (async()=>{const ts=(await get('http://127.0.0.1:9223/json/list')).filter(t=>t.type==='page');console.log('REOPEN_TARGETS='+JSON.stringify(ts.map(t=>({url:t.url,title:t.title}))));for(const t of ts){const c=connect(t);const v=await c.ev(`JSON.stringify({url:location.href,text:document.body.innerText.slice(0,3000)})`);console.log('REOPEN '+t.url+'='+v);c.ws.close();}})().catch(e=>{console.error('REOPEN_ERROR='+e.message);process.exit(1);});
           NODE
           set +e
           node "$RUNNER_TEMP/mm/reopen.cjs" > "$RUNNER_TEMP/mm/evidence/dsh-reopen.log" 2>&1
