@@ -59,17 +59,22 @@ jobs:
           const target = targets.find(t => t.type === 'page' && t.url.includes('welcome.html')) || targets.find(t => t.type === 'page');
           if (!target) throw new Error('no page target');
           const ws = new WS(target.webSocketDebuggerUrl);
+          const onEvent = (event, handler) => {
+            if (typeof ws.addEventListener === 'function') ws.addEventListener(event, handler);
+            else ws.on(event, handler);
+          };
           let seq = 0;
           const pending = new Map();
-          ws.on('message', (raw) => {
-            const msg = JSON.parse(raw.toString());
+          onEvent('message', (raw) => {
+            const text = raw && raw.data !== undefined ? raw.data : raw;
+            const msg = JSON.parse(text.toString());
             if (msg.id && pending.has(msg.id)) { const p = pending.get(msg.id); pending.delete(msg.id); msg.error ? p.reject(new Error(JSON.stringify(msg.error))) : p.resolve(msg.result); }
           });
           const send = (method, params={}) => new Promise((resolve, reject) => {
             const id = ++seq; pending.set(id, {resolve, reject}); ws.send(JSON.stringify({id, method, params}));
           });
           const sleep = ms => new Promise(r => setTimeout(r, ms));
-          await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+          await new Promise((resolve, reject) => { onEvent('open', resolve); onEvent('error', reject); });
           await send('Runtime.enable');
           const evaluate = async (expression) => {
             const r = await send('Runtime.evaluate', {expression, returnByValue: true, awaitPromise: true});
