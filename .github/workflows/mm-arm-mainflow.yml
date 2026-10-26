@@ -1,0 +1,139 @@
+name: mm-arm-mainflow
+on:
+  workflow_dispatch:
+jobs:
+  flow:
+    runs-on: macos-14
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+    steps:
+      - name: Probe host
+        run: |
+          set -euxo pipefail
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+          node --version
+          node -e 'console.log("WebSocketType="+typeof WebSocket)'
+      - name: Download and mount DMG
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume" "$RUNNER_TEMP/mm/evidence"
+          gh release download "$RELEASE_TAG" --repo "$PRIVATE_REPO" --pattern "$DMG_NAME" --dir "$RUNNER_TEMP/mm"
+          test "$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          for app in "$RUNNER_TEMP/mm/volume"/*.app; do
+            name=$(basename "$app" .app)
+            ditto "$app" "$RUNNER_TEMP/mm/$name.app"
+            xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/$name.app" 2>/dev/null || true
+          done
+          echo '--- bundle architectures ---'
+          for b in "$RUNNER_TEMP/mm"/*.app/Contents/MacOS/*; do echo "$b"; file "$b"; lipo -archs "$b" 2>&1 || true; done
+          echo '--- asar strings ---'
+          strings "$RUNNER_TEMP/mm/DeepSeek Harness.app/Contents/Resources/app.asar" 2>/dev/null | grep -Ei 'api\.deepseek|base.?url|DEEPSEEK|provider|localhost|127\.0\.0\.1' | sort -u | head -100 > "$RUNNER_TEMP/mm/evidence/app-strings.txt" || true
+          cat "$RUNNER_TEMP/mm/evidence/app-strings.txt"
+      - name: Launch main flow via CDP
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/DeepSeek Harness.app" --args --remote-debugging-port=9222 || true
+          sleep 12
+          screencapture -x "$RUNNER_TEMP/mm/evidence/01-welcome.png" || true
+          cat > "$RUNNER_TEMP/mm/cdp-flow.cjs" <<'NODE'
+          const http = require('http');
+          const get = (url) => new Promise((resolve, reject) => {
+            http.get(url, (res) => { let s=''; res.on('data', d => s += d); res.on('end', () => resolve(JSON.parse(s))); }).on('error', reject);
+          });
+          const WS = globalThis.WebSocket || require('ws');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          function connect(target) {
+            const ws = new WS(target.webSocketDebuggerUrl);
+            const onEvent = (event, handler) => {
+              if (typeof ws.addEventListener === 'function') ws.addEventListener(event, handler);
+              else ws.on(event, handler);
+            };
+            let seq = 0;
+            const pending = new Map();
+            onEvent('message', (raw) => {
+              const text = raw && raw.data !== undefined ? raw.data : raw;
+              const msg = JSON.parse(text.toString());
+              if (msg.id && pending.has(msg.id)) { const p = pending.get(msg.id); pending.delete(msg.id); msg.error ? p.reject(new Error(JSON.stringify(msg.error))) : p.resolve(msg.result); }
+            });
+            const send = (method, params={}) => new Promise((resolve, reject) => {
+              const id = ++seq; pending.set(id, {resolve, reject}); ws.send(JSON.stringify({id, method, params}));
+            });
+            const ready = new Promise((resolve, reject) => { onEvent('open', resolve); onEvent('error', reject); });
+            return {
+              ws,
+              async evaluate(expression) {
+                await ready;
+                const r = await send('Runtime.evaluate', {expression, returnByValue: true, awaitPromise: true});
+                return r.result && r.result.value;
+              }
+            };
+          }
+          async function snapshotAll(label) {
+            const targets = (await get('http://127.0.0.1:9222/json/list')).filter(t => t.type === 'page');
+            console.log('TARGETS ' + label + '=' + JSON.stringify(targets.map(t => ({id:t.id,url:t.url,title:t.title}))));
+            for (const t of targets) {
+              try {
+                const c = connect(t);
+                const value = await c.evaluate(`JSON.stringify({title:document.title,url:location.href,text:document.body.innerText,buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.innerText,disabled:b.disabled})),inputs:Array.from(document.querySelectorAll('input,textarea')).map(i=>({tag:i.tagName,type:i.type,placeholder:i.placeholder,value:i.value}))})`);
+                console.log('SNAPSHOT ' + label + ' ' + t.url + '=' + value);
+                c.ws.close();
+              } catch (e) { console.log('SNAPSHOT_ERROR ' + label + ' ' + t.url + '=' + e.message); }
+            }
+          }
+          async function clickOnWelcome(text) {
+            const targets = (await get('http://127.0.0.1:9222/json/list')).filter(t => t.type === 'page' && t.url.includes('welcome.html'));
+            if (!targets.length) return 'NO_WELCOME_TARGET';
+            const c = connect(targets[0]);
+            const result = await c.evaluate(`(()=>{const b=Array.from(document.querySelectorAll('button')).find(x=>x.innerText.trim()===${JSON.stringify(text)}||x.innerText.includes(${JSON.stringify(text)}));if(!b)return 'NOT_FOUND';b.click();return 'CLICKED';})()`);
+            await sleep(100);
+            c.ws.close();
+            return result;
+          }
+          (async () => {
+            await snapshotAll('BEFORE');
+            console.log('CLICK_ADD_API=' + await clickOnWelcome('Add API Key'));
+            await sleep(1200);
+            await snapshotAll('AFTER_ADD_API');
+            console.log('CLICK_SETUP_LATER=' + await clickOnWelcome('Set up later'));
+            await sleep(5000);
+            await snapshotAll('AFTER_SETUP_LATER');
+            screencapture('x');
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node "$RUNNER_TEMP/mm/cdp-flow.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/mainflow-cdp.log"
+          screencapture -x "$RUNNER_TEMP/mm/evidence/02-after-mainflow.png" || true
+      - name: Launch Hermes and inspect
+        if: always()
+        run: |
+          set -uxo pipefail
+          open -n "$RUNNER_TEMP/mm/Hermes Agent.app" || true
+          sleep 45
+          echo '--- processes ---'
+          pgrep -af 'Hermes|AIWS|DeepSeek' || true
+          echo '--- listening ports ---'
+          lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | sed -n '1,80p' || true
+          echo '--- hermes logs ---'
+          log show --last 2m --style compact --predicate 'process CONTAINS "Hermes" OR eventMessage CONTAINS "Hermes"' 2>&1 | tail -120 || true
+          screencapture -x "$RUNNER_TEMP/mm/evidence/hermes-after-45s.png" || true
+          system_profiler SPUSBDataType > "$RUNNER_TEMP/mm/evidence/usb.txt" 2>&1 || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-mainflow
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
