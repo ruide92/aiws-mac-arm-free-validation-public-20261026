@@ -51,7 +51,6 @@ jobs:
             -fs APFS \
             -volname "$VOLUME_NAME" \
             -type SPARSE \
-            -layout GPT \
             "$RUNNER_TEMP/mm/$VOLUME_NAME"
           hdiutil attach "$RUNNER_TEMP/mm/$VOLUME_NAME.sparseimage" \
             -nobrowse -mountpoint "$RUNNER_TEMP/mm/apfs"
