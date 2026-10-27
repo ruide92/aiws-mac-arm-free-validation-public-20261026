@@ -67,7 +67,7 @@ jobs:
             | xargs -0 -I{} sh -c 'echo "===== {} ====="; strings -a "$1" 2>/dev/null | grep -E "https?://|\.zip|\.dmg|download|update|app" | head -200' _ {} \
             | tee "$E/strings-urls.txt" || true
 
-      - name: Try installer help and package payload
+      - name: Try package payload only
         run: |
           set -uxo pipefail
           E="$RUNNER_TEMP/hermes/evidence"
@@ -76,13 +76,6 @@ jobs:
             [ -f "$pkg" ] || continue
             echo "===== pkgutil $pkg =====" | tee -a "$E/pkg.txt"
             pkgutil --payload-files "$pkg" 2>&1 | head -300 | tee -a "$E/pkg.txt" || true
-          done
-          for app in "$M"/*.app "$M"/*/*.app; do
-            [ -d "$app" ] || continue
-            exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null || true)
-            [ -n "$exe" ] || continue
-            echo "===== $app $exe --help =====" | tee -a "$E/help.txt"
-            "$app/Contents/MacOS/$exe" --help 2>&1 | head -100 | tee -a "$E/help.txt" || true
           done
 
       - name: Upload installer inspection
