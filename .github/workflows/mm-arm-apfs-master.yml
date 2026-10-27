@@ -104,7 +104,10 @@ jobs:
           # No app process was started in this build. A normal detach must succeed;
           # a forced detach is not used because it can hide a busy-volume defect.
           hdiutil detach "$RUNNER_TEMP/mm/apfs"
-          test ! -d "$RUNNER_TEMP/mm/apfs"
+          if mount | grep -F "on $RUNNER_TEMP/mm/apfs " >/dev/null; then
+            echo "APFS_MOUNT_STILL_PRESENT" >&2
+            exit 1
+          fi
           /usr/bin/time -p hdiutil convert "$VOLUME_NAME.sparseimage" \
             -format UDZO -imagekey zlib-level=1 \
             -o "$VOLUME_NAME-apfs" -ov
