@@ -1,10 +1,24 @@
 #!/bin/bash
 # 在 Apple 芯片 Mac 上做基础双击验收；不写入 Key，不做模型调用。
+# 默认检查 /Volumes/AIWSMM0004；也可以把 U 盘路径作为第一个参数传入。
 set -u
 
+VOLUME_NAME="AIWSMM0004"
+BASE="${1:-/Volumes/$VOLUME_NAME}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
-OUT="$HERE/验收结果-$(date +%Y%m%d-%H%M%S)"
+OUT="$HOME/Desktop/AIWS-验收-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
+
+fail() {
+  echo "错误：$*" >&2
+  echo
+  echo "请先把 U 盘插上，确认 Finder 里能看到 $VOLUME_NAME，再重新运行。"
+  read -r -p "按回车关闭……" _
+  exit 1
+}
+
+[ -d "$BASE/Hermes Agent.app" ] || fail "在 $BASE 找不到 Hermes Agent.app"
+[ -d "$BASE/DeepSeek Harness.app" ] || fail "在 $BASE 找不到 DeepSeek Harness.app"
 
 {
   echo "date=$(date)"
@@ -13,21 +27,20 @@ mkdir -p "$OUT"
   sw_vers
   echo
   system_profiler SPHardwareDataType | sed -n '1,40p'
+  echo
+  echo "base=$BASE"
 } > "$OUT/host.txt" 2>&1
 
 for app in "Hermes Agent.app" "DeepSeek Harness.app"; do
   echo "--- $app ---" | tee -a "$OUT/apps.txt"
-  if [ ! -d "$HERE/$app" ]; then
-    echo "MISSING" | tee -a "$OUT/apps.txt"
-    continue
-  fi
-  codesign --verify --deep --strict "$HERE/$app" >> "$OUT/apps.txt" 2>&1 && echo "codesign=OK" >> "$OUT/apps.txt" || echo "codesign=FAIL" >> "$OUT/apps.txt"
-  find "$HERE/$app" -type l ! -exec test -e {} \; -print > "$OUT/broken-links.txt" 2>&1 || true
+  codesign --verify --deep --strict "$BASE/$app" >> "$OUT/apps.txt" 2>&1 && echo "codesign=OK" >> "$OUT/apps.txt" || echo "codesign=FAIL" >> "$OUT/apps.txt"
+  find "$BASE/$app" -type l ! -exec test -e {} \; -print > "$OUT/broken-links.txt" 2>&1 || true
   if [ -s "$OUT/broken-links.txt" ]; then echo "symlinks=FAIL" >> "$OUT/apps.txt"; else echo "symlinks=OK" >> "$OUT/apps.txt"; fi
-  open -n "$HERE/$app" >> "$OUT/apps.txt" 2>&1 || true
+  open -n "$BASE/$app" >> "$OUT/apps.txt" 2>&1 || true
 done
 
-sleep 25
+# Hermes 首次打开会先显示加载动画，约 60 秒后才出现引导页；不能只等 25 秒。
+sleep 80
 pgrep -af 'Hermes|DeepSeek' > "$OUT/processes.txt" 2>&1 || true
 osascript -e 'tell application "System Events" to get name of every process whose background only is false' > "$OUT/windows.txt" 2>&1 || true
 screencapture -x "$OUT/screen.png" 2>/dev/null || true
