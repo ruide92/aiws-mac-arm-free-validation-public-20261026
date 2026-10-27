@@ -17,6 +17,15 @@ fail() {
   exit 1
 }
 
+if [ ! -d "$BASE/Hermes Agent.app" ]; then
+  for candidate in /Volumes/AIWSMM0004*; do
+    if [ -d "$candidate/Hermes Agent.app" ]; then
+      BASE="$candidate"
+      break
+    fi
+  done
+fi
+
 [ -d "$BASE/Hermes Agent.app" ] || fail "在 $BASE 找不到 Hermes Agent.app"
 [ -d "$BASE/DeepSeek Harness.app" ] || fail "在 $BASE 找不到 DeepSeek Harness.app"
 
