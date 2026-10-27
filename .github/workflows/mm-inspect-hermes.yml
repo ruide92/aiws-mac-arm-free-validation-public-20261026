@@ -1,0 +1,94 @@
+name: mm-inspect-hermes-installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect official Hermes installer
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Require Apple Silicon
+        run: |
+          set -euxo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+
+      - name: Download official installer
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/hermes"
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://hermes-assets.nousresearch.com/Hermes-Setup.dmg?build=e82bf01eec9b' \
+            -o "$RUNNER_TEMP/hermes/Hermes-Setup.dmg"
+          shasum -a 256 "$RUNNER_TEMP/hermes/Hermes-Setup.dmg" | tee "$RUNNER_TEMP/hermes/installer.sha256"
+          ls -lh "$RUNNER_TEMP/hermes/Hermes-Setup.dmg"
+
+      - name: Mount and inspect volume
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/hermes/mnt" "$RUNNER_TEMP/hermes/evidence"
+          hdiutil attach "$RUNNER_TEMP/hermes/Hermes-Setup.dmg" \
+            -nobrowse -readonly -mountpoint "$RUNNER_TEMP/hermes/mnt"
+          find "$RUNNER_TEMP/hermes/mnt" -maxdepth 4 -print | sort \
+            | tee "$RUNNER_TEMP/hermes/evidence/layout.txt"
+          ls -la "$RUNNER_TEMP/hermes/mnt" \
+            | tee "$RUNNER_TEMP/hermes/evidence/ls.txt"
+
+      - name: Inspect apps, packages and signatures
+        run: |
+          set -uxo pipefail
+          E="$RUNNER_TEMP/hermes/evidence"
+          M="$RUNNER_TEMP/hermes/mnt"
+          find "$M" -maxdepth 4 \( -name '*.app' -o -name '*.pkg' -o -name '*.zip' -o -name '*.dmg' \) -print \
+            | tee "$E/installers.txt"
+          while IFS= read -r app; do
+            [ -d "$app" ] || continue
+            echo "===== $app =====" | tee -a "$E/apps.txt"
+            plutil -p "$app/Contents/Info.plist" 2>&1 | tee -a "$E/apps.txt" || true
+            codesign -dv --verbose=4 "$app" 2>&1 | tee -a "$E/signatures.txt" || true
+            codesign --verify --deep --strict --verbose=2 "$app" 2>&1 | tee -a "$E/signatures.txt" || true
+            spctl --assess --type execute --verbose=4 "$app" 2>&1 | tee -a "$E/spctl.txt" || true
+            stapler validate "$app" 2>&1 | tee -a "$E/stapler.txt" || true
+            find "$app/Contents" -maxdepth 3 -type f -print | sort | tee -a "$E/apps.txt" || true
+          done < "$E/installers.txt"
+
+      - name: Extract strings from installer binaries
+        run: |
+          set -uxo pipefail
+          E="$RUNNER_TEMP/hermes/evidence"
+          find "$RUNNER_TEMP/hermes/mnt" -type f -perm -111 -maxdepth 6 -print0 \
+            | xargs -0 -I{} sh -c 'echo "===== {} ====="; strings -a "$1" 2>/dev/null | grep -E "https?://|\.zip|\.dmg|download|update|app" | head -200' _ {} \
+            | tee "$E/strings-urls.txt" || true
+
+      - name: Try installer help and package payload
+        run: |
+          set -uxo pipefail
+          E="$RUNNER_TEMP/hermes/evidence"
+          M="$RUNNER_TEMP/hermes/mnt"
+          for pkg in "$M"/*.pkg "$M"/*/*.pkg; do
+            [ -f "$pkg" ] || continue
+            echo "===== pkgutil $pkg =====" | tee -a "$E/pkg.txt"
+            pkgutil --payload-files "$pkg" 2>&1 | head -300 | tee -a "$E/pkg.txt" || true
+          done
+          for app in "$M"/*.app "$M"/*/*.app; do
+            [ -d "$app" ] || continue
+            exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null || true)
+            [ -n "$exe" ] || continue
+            echo "===== $app $exe --help =====" | tee -a "$E/help.txt"
+            "$app/Contents/MacOS/$exe" --help 2>&1 | head -100 | tee -a "$E/help.txt" || true
+          done
+
+      - name: Upload installer inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-installer-inspection
+          path: ${{ runner.temp }}/hermes/evidence
+          if-no-files-found: warn
