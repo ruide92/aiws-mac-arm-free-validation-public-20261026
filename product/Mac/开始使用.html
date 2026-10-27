@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mac 版使用说明</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f7f9; --card:#fff; --text:#1d2433; --muted:#5d6678; --line:#e4e7ec; --accent:#0b63ce; --warn:#8a4b00; --warnbg:#fff4df; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141820; --card:#1c222c; --text:#edf1f7; --muted:#aab4c3; --line:#303948; --accent:#77b7ff; --warn:#ffd08a; --warnbg:#332713; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.75 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif; }
+  main { max-width:820px; margin:0 auto; padding:44px 22px 64px; }
+  h1 { font-size:30px; line-height:1.25; margin:0 0 8px; letter-spacing:.2px; }
+  .sub { color:var(--muted); margin:0 0 28px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px 24px; margin:16px 0; box-shadow:0 8px 28px rgba(20,30,50,.06); }
+  h2 { font-size:19px; margin:0 0 12px; }
+  p { margin:8px 0; }
+  ul,ol { margin:8px 0 8px 22px; padding:0; }
+  li { margin:7px 0; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92em; background:rgba(127,127,127,.12); padding:2px 6px; border-radius:6px; }
+  .apps { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }
+  .app { border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .app b { display:block; font-size:17px; margin-bottom:4px; }
+  .app span { color:var(--muted); font-size:14px; }
+  .warn { background:var(--warnbg); color:var(--warn); border:1px solid color-mix(in srgb,var(--warn) 25%,transparent); border-radius:12px; padding:14px 16px; margin:18px 0; }
+  .muted { color:var(--muted); font-size:14px; }
+  @media (max-width:600px){ .apps{grid-template-columns:1fr;} h1{font-size:25px;} main{padding-top:30px;} }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mac 版使用说明</h1>
+  <p class="sub">Apple 芯片（M 系列）· APFS U 盘 · 两个完整官方 App</p>
+
+  <div class="card">
+    <h2>U 盘里有什么</h2>
+    <div class="apps">
+      <div class="app"><b>Hermes Agent</b><span>通用 AI 助手</span></div>
+      <div class="app"><b>DeepSeek Harness</b><span>编程用的 AI 工作台</span></div>
+    </div>
+    <p>两个程序都是完整官方版本，直接双击就能开，不需要先打开任何“工作站”或“配置中心”。</p>
+  </div>
+
+  <div class="warn">
+    <b>这是 Mac 专用盘。</b>文件系统是 APFS，Windows 电脑不能读。
+    插到 Windows 上如果提示格式化，点“取消”，不要格式化。
+  </div>
+
+  <div class="card">
+    <h2>第一次使用</h2>
+    <ol>
+      <li>双击 <b>Hermes Agent</b> 或 <b>DeepSeek Harness</b>。</li>
+      <li>如果 macOS 提示“无法验证开发者”，在程序图标上右键，选“打开”，再确认一次。</li>
+      <li>在程序自己的设置里填你自己的 API Key，或登录你自己的账号。</li>
+      <li>第一次启动会慢一点，是在从 U 盘读取程序本体；窗口没出来前不要反复双击。</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>使用边界</h2>
+    <ul>
+      <li>本产品不附带 Key、不共享账号、不提供卖家代充或代理。</li>
+      <li>模型服务由你自己选择、自己付费；使用过程需要联网。</li>
+      <li>程序和聊天记录保存在当前这台 Mac 上，不写回 U 盘。换电脑要重新填 Key。</li>
+      <li>程序开着时不要拔 U 盘；先退出程序，再在 Finder 里推出。</li>
+      <li>不要删除、改名或单独搬走任何一个 <code>.app</code>；它们是完整程序包。</li>
+      <li>这是 Apple 芯片版本，Intel Mac 不能运行。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>出问题怎么办</h2>
+    <p>先确认 Finder 里能看到 U 盘，根目录两个 <code>.app</code> 都在。程序打不开时，把整个 <code>.app</code> 从备份复制回来；不要拆开 <code>.app</code> 内部文件。</p>
+    <p>U 盘被误格式化后需要重新制作，请联系卖家获取同版本 APFS 母版。不要在 Windows 上格式化或“修复”这块盘。</p>
+  </div>
+
+  <p class="muted">本产品为独立软件产品，与 OpenAI、Anthropic、DeepSeek 等模型厂商无隶属关系。AI 生成内容可能不准确，请自行核对。</p>
+</main>
+</body>
+</html>

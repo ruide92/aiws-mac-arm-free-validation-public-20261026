@@ -1,0 +1,196 @@
+name: mm-arm-apfs-direct
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+      RELEASE_TAG: arm64-free-validation-20261026
+      DMG_NAME: arm64.dmg
+      EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+      VOLUME_NAME: AIWSMM0004
+      IMAGE_SIZE: 12g
+
+    steps:
+      - name: Checkout docs and probes
+        uses: actions/checkout@v4
+
+      - name: Require Apple Silicon
+        run: |
+          set -euxo pipefail
+          test "$(uname -m)" = "arm64"
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+
+      - name: Download official arm64 payload
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/volume" "$RUNNER_TEMP/mm/evidence" "$RUNNER_TEMP/mm/apfs"
+          gh release download "$RELEASE_TAG" \
+            --repo "$PRIVATE_REPO" \
+            --pattern "$DMG_NAME" \
+            --dir "$RUNNER_TEMP/mm"
+          actual=$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')
+          test "$actual" = "$EXPECTED_SHA256"
+          hdiutil attach "$RUNNER_TEMP/mm/$DMG_NAME" \
+            -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+
+      - name: Create APFS volume and copy complete apps
+        run: |
+          set -euxo pipefail
+          hdiutil create \
+            -size "$IMAGE_SIZE" \
+            -fs APFS \
+            -volname "$VOLUME_NAME" \
+            -type SPARSE \
+            -layout GPT \
+            "$RUNNER_TEMP/mm/$VOLUME_NAME"
+          hdiutil attach "$RUNNER_TEMP/mm/$VOLUME_NAME.sparseimage" \
+            -nobrowse -mountpoint "$RUNNER_TEMP/mm/apfs"
+
+          count=$(find "$RUNNER_TEMP/mm/volume" -maxdepth 3 -name '*.app' -type d | wc -l | tr -d ' ')
+          test "$count" = "2"
+          for app in "$RUNNER_TEMP/mm/volume"/*/*.app "$RUNNER_TEMP/mm/volume"/*.app; do
+            [ -d "$app" ] || continue
+            name=$(basename "$app")
+            case "$name" in
+              "Hermes Agent.app"|"DeepSeek Harness.app") ;;
+              *) continue ;;
+            esac
+            ditto "$app" "$RUNNER_TEMP/mm/apfs/$name"
+            xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/apfs/$name" 2>/dev/null || true
+          done
+
+          for f in "开始使用.html" "先看这里.txt"; do
+            test -f "$GITHUB_WORKSPACE/product/Mac/$f"
+            ditto "$GITHUB_WORKSPACE/product/Mac/$f" "$RUNNER_TEMP/mm/apfs/$f"
+          done
+          {
+            echo "product=$VOLUME_NAME"
+            echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "payload_sha256=$EXPECTED_SHA256"
+            echo "runner=$(uname -m)"
+            echo "apps=Hermes Agent.app,DeepSeek Harness.app"
+          } > "$RUNNER_TEMP/mm/apfs/版本信息.txt"
+
+          test "$(find "$RUNNER_TEMP/mm/apfs" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d ' ')" = "2"
+          ls -la "$RUNNER_TEMP/mm/apfs"
+          du -sh "$RUNNER_TEMP/mm/apfs"
+
+      - name: Verify APFS layout, links and signatures
+        run: |
+          set -euxo pipefail
+          APFS="$RUNNER_TEMP/mm/apfs"
+          EVIDENCE="$RUNNER_TEMP/mm/evidence"
+          for app in "Hermes Agent.app" "DeepSeek Harness.app"; do
+            test -d "$APFS/$app"
+            echo "--- $app ---" | tee -a "$EVIDENCE/signatures.txt"
+            codesign --verify --deep --strict "$APFS/$app" | tee -a "$EVIDENCE/signatures.txt"
+            codesign -dv --verbose=2 "$APFS/$app" >> "$EVIDENCE/signatures.txt" 2>&1 || true
+            count=$(find "$APFS/$app" -type l | wc -l | tr -d ' ')
+            broken=$(find "$APFS/$app" -type l ! -exec test -e {} \; -print | wc -l | tr -d ' ')
+            echo "$app symlinks=$count broken=$broken" | tee -a "$EVIDENCE/links.txt"
+            test "$broken" = "0"
+            if spctl --assess --type execute --verbose=4 "$APFS/$app" >> "$EVIDENCE/spctl.txt" 2>&1; then
+              echo "$app spctl=accepted" | tee -a "$EVIDENCE/spctl.txt"
+            else
+              echo "$app spctl=rejected_or_unnotarized" | tee -a "$EVIDENCE/spctl.txt"
+            fi
+          done
+          find "$APFS" -maxdepth 2 -print | sed -n '1,200p' > "$EVIDENCE/layout.txt"
+          test -f "$APFS/开始使用.html"
+          test -f "$APFS/先看这里.txt"
+
+      - name: Launch both apps directly from APFS
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          APFS="$RUNNER_TEMP/mm/apfs"
+          EVIDENCE="$RUNNER_TEMP/mm/evidence"
+          open -n "$APFS/DeepSeek Harness.app" --args --remote-debugging-port=9222 || true
+          sleep 15
+          node "$GITHUB_WORKSPACE/product/ci/dsh-probe.cjs" 2>&1 | tee "$EVIDENCE/dsh-probe.log" || true
+          screencapture -x "$EVIDENCE/01-dsh-from-apfs.png" || true
+
+          open -n "$APFS/Hermes Agent.app" --args --remote-debugging-port=9223 || true
+          sleep 20
+          node "$GITHUB_WORKSPACE/product/ci/hermes-probe.cjs" 2>&1 | tee "$EVIDENCE/hermes-probe.log" || true
+          screencapture -x "$EVIDENCE/02-hermes-from-apfs.png" || true
+
+          pgrep -af 'DeepSeek|Hermes' > "$EVIDENCE/processes.txt" 2>&1 || true
+          osascript -e 'tell application "System Events" to get name of every process whose background only is false' \
+            > "$EVIDENCE/windows.txt" 2>&1 || true
+          system_profiler SPUSBDataType > "$EVIDENCE/usb.txt" 2>&1 || true
+
+      - name: Quit and reopen both apps
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          APFS="$RUNNER_TEMP/mm/apfs"
+          EVIDENCE="$RUNNER_TEMP/mm/evidence"
+          osascript -e 'tell application "DeepSeek Harness" to quit' 2>&1 || true
+          osascript -e 'tell application "Hermes Agent" to quit' 2>&1 || true
+          sleep 5
+          open -n "$APFS/DeepSeek Harness.app" || true
+          open -n "$APFS/Hermes Agent.app" || true
+          sleep 25
+          pgrep -af 'DeepSeek|Hermes' > "$EVIDENCE/reopen-processes.txt" 2>&1 || true
+          screencapture -x "$EVIDENCE/03-reopen-both.png" || true
+
+      - name: Dump APFS manifest
+        if: always()
+        run: |
+          set -euxo pipefail
+          APFS="$RUNNER_TEMP/mm/apfs"
+          EVIDENCE="$RUNNER_TEMP/mm/evidence"
+          find "$APFS" -type f -print0 | xargs -0 shasum -a 256 \
+            > "$EVIDENCE/apfs-files.sha256" 2>&1 || true
+          du -sh "$APFS" > "$EVIDENCE/du.txt" 2>&1 || true
+          find "$APFS" -type l -print > "$EVIDENCE/symlinks.txt" 2>&1 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-apfs-evidence
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
+
+      - name: Detach and compress APFS image
+        if: always()
+        run: |
+          set -euxo pipefail
+          hdiutil detach "$RUNNER_TEMP/mm/apfs" -force 2>&1 || true
+          hdiutil detach "$RUNNER_TEMP/mm/volume" -force 2>&1 || true
+          if [ -f "$RUNNER_TEMP/mm/$VOLUME_NAME.sparseimage" ]; then
+            hdiutil convert "$RUNNER_TEMP/mm/$VOLUME_NAME.sparseimage" \
+              -format UDZO -o "$RUNNER_TEMP/mm/$VOLUME_NAME-apfs" -ov
+            hdiutil verify "$RUNNER_TEMP/mm/$VOLUME_NAME-apfs.dmg"
+            shasum -a 256 "$RUNNER_TEMP/mm/$VOLUME_NAME-apfs.dmg" \
+              | tee "$RUNNER_TEMP/mm/evidence/apfs-image.sha256"
+          fi
+
+      - name: Upload APFS master image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-apfs-master
+          path: ${{ runner.temp }}/mm/AIWSMM0004-apfs.dmg
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Upload Mac docs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-apfs-docs
+          path: product/Mac
+          if-no-files-found: warn
