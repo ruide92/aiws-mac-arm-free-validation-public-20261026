@@ -1,0 +1,105 @@
+name: mm-arm-apfs-gui-final
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  gui:
+    name: Launch both apps from APFS master
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Require Apple Silicon
+        run: |
+          set -euxo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sysctl -n machdep.cpu.brand_string
+
+      - name: Checkout probes
+        uses: actions/checkout@v4
+
+      - name: Download verified APFS master
+        uses: actions/download-artifact@v4
+        with:
+          name: mm-arm-apfs-master
+          run-id: 40444974422
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/mm
+
+      - name: Mount master read-only
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm/mnt" "$RUNNER_TEMP/mm/evidence"
+          hdiutil attach "$RUNNER_TEMP/mm/AIWSMM0004-apfs.dmg" \
+            -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/mnt"
+          test -d "$RUNNER_TEMP/mm/mnt/Hermes Agent.app"
+          test -d "$RUNNER_TEMP/mm/mnt/DeepSeek Harness.app"
+          test ! -e "$RUNNER_TEMP/mm/mnt/AI工作站.app"
+          df -h "$RUNNER_TEMP/mm/mnt" | tee "$RUNNER_TEMP/mm/evidence/volume.txt"
+
+      - name: Launch DSH and wait for real UI
+        run: |
+          set -uxo pipefail
+          cd "$RUNNER_TEMP/mm"
+          open -n "$RUNNER_TEMP/mm/mnt/DeepSeek Harness.app" --args --remote-debugging-port=9222 || true
+          sleep 45
+          screencapture -x "$RUNNER_TEMP/mm/evidence/01-dsh-45s.png" || true
+          node "$GITHUB_WORKSPACE/product/ci/dsh-probe.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/dsh-probe.log" || true
+          sleep 10
+          screencapture -x "$RUNNER_TEMP/mm/evidence/02-dsh-55s.png" || true
+          pgrep -af 'DeepSeek|Hermes' | tee "$RUNNER_TEMP/mm/evidence/processes.txt" || true
+          osascript -e 'tell application "System Events" to get name of every process whose background only is false' \
+            > "$RUNNER_TEMP/mm/evidence/windows.txt" 2>&1 || true
+
+      - name: Launch Hermes and wait for real UI
+        run: |
+          set -uxo pipefail
+          cd "$RUNNER_TEMP/mm"
+          open -n "$RUNNER_TEMP/mm/mnt/Hermes Agent.app" --args --remote-debugging-port=9223 || true
+          sleep 60
+          osascript -e 'tell application "Hermes Agent" to activate' 2>&1 || true
+          sleep 3
+          screencapture -x "$RUNNER_TEMP/mm/evidence/03-hermes-63s.png" || true
+          node "$GITHUB_WORKSPACE/product/ci/hermes-probe.cjs" 2>&1 | tee "$RUNNER_TEMP/mm/evidence/hermes-probe.log" || true
+          sleep 15
+          osascript -e 'tell application "Hermes Agent" to activate' 2>&1 || true
+          sleep 2
+          screencapture -x "$RUNNER_TEMP/mm/evidence/04-hermes-80s.png" || true
+          pgrep -af 'DeepSeek|Hermes' | tee "$RUNNER_TEMP/mm/evidence/processes-after-hermes.txt" || true
+
+      - name: Quit and reopen from master
+        if: always()
+        run: |
+          set -uxo pipefail
+          osascript -e 'tell application "DeepSeek Harness" to quit' 2>&1 || true
+          osascript -e 'tell application "Hermes Agent" to quit' 2>&1 || true
+          sleep 8
+          open -n "$RUNNER_TEMP/mm/mnt/DeepSeek Harness.app" || true
+          sleep 35
+          open -n "$RUNNER_TEMP/mm/mnt/Hermes Agent.app" || true
+          sleep 45
+          osascript -e 'tell application "Hermes Agent" to activate' 2>&1 || true
+          sleep 3
+          screencapture -x "$RUNNER_TEMP/mm/evidence/05-reopen-both.png" || true
+          pgrep -af 'DeepSeek|Hermes' | tee "$RUNNER_TEMP/mm/evidence/processes-reopen.txt" || true
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set -uxo pipefail
+          hdiutil info > "$RUNNER_TEMP/mm/evidence/hdiutil-info.txt" 2>&1 || true
+          sw_vers > "$RUNNER_TEMP/mm/evidence/sw-vers.txt" 2>&1 || true
+          system_profiler SPHardwareDataType > "$RUNNER_TEMP/mm/evidence/hardware.txt" 2>&1 || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-apfs-gui-final
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
