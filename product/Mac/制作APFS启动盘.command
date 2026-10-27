@@ -55,7 +55,7 @@ for app in "Hermes Agent.app" "DeepSeek Harness.app"; do
   ditto "$MOUNT/$app" "$TARGET/$app"
 done
 
-for f in "开始使用.html" "先看这里.txt"; do
+for f in "开始使用.html" "先看这里.txt" "版本信息.txt"; do
   [ -f "$MOUNT/$f" ] && ditto "$MOUNT/$f" "$TARGET/$f"
 done
 
