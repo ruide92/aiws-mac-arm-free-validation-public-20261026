@@ -3,17 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mac 版使用说明</title>
+<title>Mac 版使用说明 · 配置中心</title>
 <style>
-  :root { color-scheme: light dark; --bg:#f6f7f9; --card:#fff; --text:#1d2433; --muted:#5d6678; --line:#e4e7ec; --accent:#0b63ce; --warn:#8a4b00; --warnbg:#fff4df; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#141820; --card:#1c222c; --text:#edf1f7; --muted:#aab4c3; --line:#303948; --accent:#77b7ff; --warn:#ffd08a; --warnbg:#332713; } }
+  :root { color-scheme: light dark; --bg:#f6f7f9; --card:#fff; --text:#1d2433; --muted:#5d6678; --line:#e4e7ec; --accent:#0b63ce; --warn:#8a4b00; --warnbg:#fff4df; --ok:#146c43; --okbg:#e8f5ee; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141820; --card:#1c222c; --text:#edf1f7; --muted:#aab4c3; --line:#303948; --accent:#77b7ff; --warn:#ffd08a; --warnbg:#332713; --ok:#8fe0b2; --okbg:#173325; } }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.75 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif; }
-  main { max-width:820px; margin:0 auto; padding:44px 22px 64px; }
+  main { max-width:840px; margin:0 auto; padding:44px 22px 64px; }
   h1 { font-size:30px; line-height:1.25; margin:0 0 8px; letter-spacing:.2px; }
   .sub { color:var(--muted); margin:0 0 28px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px 24px; margin:16px 0; box-shadow:0 8px 28px rgba(20,30,50,.06); }
   h2 { font-size:19px; margin:0 0 12px; }
+  h3 { font-size:16px; margin:18px 0 6px; }
   p { margin:8px 0; }
   ul,ol { margin:8px 0 8px 22px; padding:0; }
   li { margin:7px 0; }
@@ -23,14 +24,16 @@
   .app b { display:block; font-size:17px; margin-bottom:4px; }
   .app span { color:var(--muted); font-size:14px; }
   .warn { background:var(--warnbg); color:var(--warn); border:1px solid color-mix(in srgb,var(--warn) 25%,transparent); border-radius:12px; padding:14px 16px; margin:18px 0; }
+  .ok { background:var(--okbg); color:var(--ok); border:1px solid color-mix(in srgb,var(--ok) 25%,transparent); border-radius:12px; padding:14px 16px; margin:18px 0; }
   .muted { color:var(--muted); font-size:14px; }
+  .path { font-weight:600; }
   @media (max-width:600px){ .apps{grid-template-columns:1fr;} h1{font-size:25px;} main{padding-top:30px;} }
 </style>
 </head>
 <body>
 <main>
   <h1>Mac 版使用说明</h1>
-  <p class="sub">Apple 芯片（M 系列）· APFS U 盘 · 两个完整官方 App</p>
+  <p class="sub">Apple 芯片（M 系列）· APFS U 盘 · 两个完整官方 App · 插盘双击</p>
 
   <div class="card">
     <h2>U 盘里有什么</h2>
@@ -38,7 +41,7 @@
       <div class="app"><b>Hermes Agent</b><span>通用 AI 助手</span></div>
       <div class="app"><b>DeepSeek Harness</b><span>编程用的 AI 工作台</span></div>
     </div>
-    <p>两个程序都是完整官方版本，直接双击就能开，不需要先打开任何“工作站”或“配置中心”。</p>
+    <p>两个都是完整官方版本，直接双击打开，不需要先安装。U 盘不附带 API Key、账号或代理，Key 由你自己在 App 的配置中心里填写。</p>
   </div>
 
   <div class="warn">
@@ -47,13 +50,39 @@
   </div>
 
   <div class="card">
-    <h2>第一次使用</h2>
+    <h2>第一次使用（按顺序做）</h2>
     <ol>
+      <li>把 U 盘插到 Apple 芯片 Mac 上，在 Finder 里打开 <b>AIWSMM0005</b>。</li>
       <li>双击 <b>Hermes Agent</b> 或 <b>DeepSeek Harness</b>。</li>
-      <li>如果 macOS 提示“无法验证开发者”，在程序图标上右键，选“打开”，再确认一次。</li>
-      <li>在程序自己的设置里填你自己的 API Key，或登录你自己的账号。</li>
-      <li>第一次启动会慢一点，是在从 U 盘读取程序本体；窗口没出来前不要反复双击。</li>
+      <li>如果 macOS 提示“无法验证开发者”，在程序图标上右键，选“打开”，再确认一次。官方签名版本通常不会出现这一步。</li>
+      <li>打开 App 后，进入它自己的<b>配置中心</b>（设置页），填入你自己的 API Key，选一个模型。</li>
+      <li>回到对话窗口，发一句话测试；能正常回复就配置好了。第一次启动会慢一点，窗口没出来前不要反复双击。</li>
     </ol>
+  </div>
+
+  <div class="card">
+    <h2>配置中心怎么填</h2>
+    <p>两个 App 各自带配置中心，不需要先打开任何“工作站”。第一次打开时按界面提示走；找不到入口时，照下面找：</p>
+
+    <h3>Hermes Agent</h3>
+    <ol>
+      <li>打开 App，点左下角或右上角的 <b>设置 / Settings</b>。</li>
+      <li>找到 <b>模型服务 / Providers / API Keys</b>。</li>
+      <li>选你用的服务商（OpenAI、DeepSeek、Anthropic、OpenRouter 等），粘贴对应的 API Key；如果你用的是兼容 OpenAI 的中转服务，按它的说明填 Base URL 和模型名。</li>
+      <li>保存后，在模型选择器里选中刚配置的模型。</li>
+    </ol>
+
+    <h3>DeepSeek Harness</h3>
+    <ol>
+      <li>打开 App，点左下角 <b>设置 / Settings</b>。</li>
+      <li>进入 <b>模型 / Models</b>，找到 <b>DeepSeek</b> 卡片（或“添加自定义提供方”）。</li>
+      <li>粘贴你自己的 API Key；用第三方兼容服务时，同时填它的 Base URL 和模型 ID。</li>
+      <li>保存后回到会话，在模型选择器里选中该模型。</li>
+    </ol>
+
+    <div class="ok">
+      <b>只填自己的 Key。</b>Key 只保存在你当前这台 Mac 上（App 自己的配置/钥匙串），不会写回 U 盘，也不会发给卖家。换一台电脑要重新填。
+    </div>
   </div>
 
   <div class="card">
@@ -61,7 +90,7 @@
     <ul>
       <li>本产品不附带 Key、不共享账号、不提供卖家代充或代理。</li>
       <li>模型服务由你自己选择、自己付费；使用过程需要联网。</li>
-      <li>程序和聊天记录保存在当前这台 Mac 上，不写回 U 盘。换电脑要重新填 Key。</li>
+      <li>程序和聊天记录保存在当前这台 Mac 上，不写回 U 盘。</li>
       <li>程序开着时不要拔 U 盘；先退出程序，再在 Finder 里推出。</li>
       <li>不要删除、改名或单独搬走任何一个 <code>.app</code>；它们是完整程序包。</li>
       <li>这是 Apple 芯片版本，Intel Mac 不能运行。</li>

@@ -1,0 +1,204 @@
+name: mm-arm-build-max
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PRODUCT_ID: AIWS-2610-MM-0005
+  VOLUME_NAME: AIWSMM0005
+  IMAGE_SIZE: 8g
+  HERMES_INSTALLER_SHA256: B61E047EFE3059FAF1C55FEC3252E661F2D2A993A7A3EEBF5CC6A9AA5C1790F5
+  DSH_INSTALLER_SHA256: 0C2217C2C9110D0B5104AF8EB4DF55F214239405D079D0A83E30080CE1CBD1E1
+
+jobs:
+  build:
+    name: Build Max APFS master from verified apps
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Require Apple Silicon
+        run: |
+          set -euxo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+
+      - name: Checkout docs
+        uses: actions/checkout@v4
+
+      - name: Download verified MM-0004 app payload
+        uses: actions/download-artifact@v4
+        with:
+          name: mm-arm-apfs-master
+          run-id: 40444974422
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/mm/src
+
+      - name: Mount source apps and verify their identity
+        run: |
+          set -euxo pipefail
+          SRC="$RUNNER_TEMP/mm/src"
+          MNT="$RUNNER_TEMP/mm/src-mnt"
+          EV="$RUNNER_TEMP/mm/evidence"
+          mkdir -p "$MNT" "$EV"
+          hdiutil attach "$SRC/AIWSMM0004-apfs.dmg" -nobrowse -readonly -mountpoint "$MNT"
+          test -d "$MNT/Hermes Agent.app"
+          test -d "$MNT/DeepSeek Harness.app"
+
+          HERMES_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$MNT/Hermes Agent.app/Contents/Info.plist")
+          DSH_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$MNT/DeepSeek Harness.app/Contents/Info.plist")
+          echo "HERMES_VER=$HERMES_VER" | tee "$EV/versions.txt"
+          echo "DSH_VER=$DSH_VER" | tee -a "$EV/versions.txt"
+
+          for app in "Hermes Agent.app" "DeepSeek Harness.app"; do
+            echo "===== $app =====" | tee -a "$EV/source-signatures.txt"
+            codesign --verify --deep --strict --verbose=2 "$MNT/$app" 2>&1 | tee -a "$EV/source-signatures.txt"
+            codesign -dv --verbose=4 "$MNT/$app" 2>&1 | tee -a "$EV/source-signatures.txt" || true
+            spctl --assess --type execute --verbose=4 "$MNT/$app" 2>&1 | tee -a "$EV/source-spctl.txt" || true
+            stapler validate "$MNT/$app" 2>&1 | tee -a "$EV/source-stapler.txt" || true
+          done
+
+          # Keep versions available to later steps.
+          {
+            echo "HERMES_VER=$HERMES_VER"
+            echo "DSH_VER=$DSH_VER"
+          } > "$RUNNER_TEMP/mm/versions.env"
+
+      - name: Create new APFS volume with exactly the product files
+        run: |
+          set -euxo pipefail
+          . "$RUNNER_TEMP/mm/versions.env"
+          W="$RUNNER_TEMP/mm/work"
+          MNT="$W/mnt"
+          EV="$RUNNER_TEMP/mm/evidence"
+          mkdir -p "$W" "$MNT" "$EV"
+
+          hdiutil create -size "$IMAGE_SIZE" -fs APFS -volname "$VOLUME_NAME" \
+            -type SPARSE "$W/$VOLUME_NAME"
+          hdiutil attach "$W/$VOLUME_NAME.sparseimage" -nobrowse -mountpoint "$MNT"
+
+          ditto "$RUNNER_TEMP/mm/src-mnt/Hermes Agent.app" "$MNT/Hermes Agent.app"
+          ditto "$RUNNER_TEMP/mm/src-mnt/DeepSeek Harness.app" "$MNT/DeepSeek Harness.app"
+          xattr -dr com.apple.quarantine "$MNT/Hermes Agent.app" 2>/dev/null || true
+          xattr -dr com.apple.quarantine "$MNT/DeepSeek Harness.app" 2>/dev/null || true
+
+          for f in "开始使用.html" "先看这里.txt"; do
+            test -f "$GITHUB_WORKSPACE/product/Mac/$f"
+            ditto "$GITHUB_WORKSPACE/product/Mac/$f" "$MNT/$f"
+          done
+
+          {
+            echo "产品: AIWS Max Apple Silicon 官方双应用版"
+            echo "型号: $PRODUCT_ID"
+            echo "版本: 2610.16"
+            echo "卷标: $VOLUME_NAME"
+            echo "构建时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Hermes Agent.app: $HERMES_VER"
+            echo "DeepSeek Harness.app: $DSH_VER"
+            echo "Hermes 官方安装器 SHA256: $HERMES_INSTALLER_SHA256"
+            echo "DeepSeek Harness 官方 DMG SHA256: $DSH_INSTALLER_SHA256"
+            echo "说明: 本盘不含 API Key、账号、代理；配置中心由用户自行填写。"
+          } > "$MNT/版本信息.txt"
+
+          sync
+          find "$MNT" -maxdepth 1 -mindepth 1 -print | sort | tee "$EV/layout-new.txt"
+          df -h "$MNT" | tee "$EV/df-new.txt"
+
+      - name: Verify the new volume before imaging
+        run: |
+          set -euxo pipefail
+          MNT="$RUNNER_TEMP/mm/work/mnt"
+          EV="$RUNNER_TEMP/mm/evidence"
+          test "$(find "$MNT" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d ' ')" = "2"
+          test -d "$MNT/Hermes Agent.app"
+          test -d "$MNT/DeepSeek Harness.app"
+          test -f "$MNT/开始使用.html"
+          test -f "$MNT/先看这里.txt"
+          test -f "$MNT/版本信息.txt"
+          test ! -e "$MNT/AI工作站.app"
+          test ! -e "$MNT/Mac"
+          test ! -e "$MNT/程序"
+
+          for app in "Hermes Agent.app" "DeepSeek Harness.app"; do
+            echo "===== $app =====" | tee -a "$EV/signatures.txt"
+            codesign --verify --deep --strict --verbose=2 "$MNT/$app" 2>&1 | tee -a "$EV/signatures.txt"
+            codesign -dv --verbose=4 "$MNT/$app" 2>&1 | tee -a "$EV/signatures.txt" || true
+            spctl --assess --type execute --verbose=4 "$MNT/$app" 2>&1 | tee -a "$EV/spctl.txt" || true
+            stapler validate "$MNT/$app" 2>&1 | tee -a "$EV/stapler.txt" || true
+            broken=$(find "$MNT/$app" -type l ! -exec test -e {} \; -print | wc -l | tr -d ' ')
+            echo "$app broken_symlinks=$broken" | tee -a "$EV/links.txt"
+            test "$broken" = "0"
+          done
+
+          test "$(find "$MNT" -maxdepth 1 -type f | wc -l | tr -d ' ')" = "3"
+          echo "MAX_LAYOUT=PASS" | tee -a "$EV/verify.txt"
+
+      - name: Detach, build DMG and raw
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/mm/work"
+          EV="$RUNNER_TEMP/mm/evidence"
+          hdiutil detach "$W/mnt"
+          # Build the compressed master first (this is the browsable artifact).
+          hdiutil convert "$W/$VOLUME_NAME.sparseimage" -format UDZO -imagekey zlib-level=1 \
+            -o "$W/$VOLUME_NAME-apfs" -ov
+          hdiutil verify "$W/$VOLUME_NAME-apfs.dmg"
+          shasum -a 256 "$W/$VOLUME_NAME-apfs.dmg" | tee "$EV/apfs-image.sha256"
+          ls -lh "$W/$VOLUME_NAME-apfs.dmg" | tee -a "$EV/verify.txt"
+
+          # The factory consumes a whole-disk raw image; preserve the same GPT/APFS layout.
+          hdiutil convert "$W/$VOLUME_NAME.sparseimage" -format UDRW -o "$W/$VOLUME_NAME" -ov
+          # hdiutil may append .dmg; normalize to the factory's expected raw name.
+          if [ -f "$W/$VOLUME_NAME.raw" ]; then :; elif [ -f "$W/$VOLUME_NAME.dmg" ]; then mv "$W/$VOLUME_NAME.dmg" "$W/$VOLUME_NAME.raw"; else
+            echo "RAW_OUTPUT_NOT_FOUND" >&2; ls -la "$W"; exit 1
+          fi
+          test "$(stat -f%z "$W/$VOLUME_NAME.raw")" = "8589934592"
+          hdiutil pmap "$W/$VOLUME_NAME.raw" | tee "$EV/raw-pmap.txt" || true
+          shasum -a 256 "$W/$VOLUME_NAME.raw" | tee "$EV/raw.sha256"
+          # Free the sparse bundle before creating the ZIP64 copy.
+          rm -rf "$W/$VOLUME_NAME.sparseimage"
+          # ZIP64 is required for the 8 GiB raw file.
+          (cd "$W" && zip -1 -q "$VOLUME_NAME.raw.zip" "$VOLUME_NAME.raw")
+          ls -lh "$W/$VOLUME_NAME.raw.zip" | tee -a "$EV/verify.txt"
+
+      - name: Re-mount DMG and final verify
+        run: |
+          set -euxo pipefail
+          W="$RUNNER_TEMP/mm/work"
+          EV="$RUNNER_TEMP/mm/evidence"
+          hdiutil attach "$W/$VOLUME_NAME-apfs.dmg" -nobrowse -readonly -mountpoint "$W/final"
+          test "$(find "$W/final" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d ' ')" = "2"
+          test -f "$W/final/开始使用.html"
+          test -f "$W/final/先看这里.txt"
+          test -f "$W/final/版本信息.txt"
+          for app in "Hermes Agent.app" "DeepSeek Harness.app"; do
+            codesign --verify --deep --strict --verbose=2 "$W/final/$app" 2>&1 | tee -a "$EV/final-verify.txt"
+            broken=$(find "$W/final/$app" -type l ! -exec test -e {} \; -print | wc -l | tr -d ' ')
+            test "$broken" = "0"
+          done
+          echo "FINAL_DMG_VERIFY=PASS" | tee -a "$EV/final-verify.txt"
+          hdiutil detach "$W/final"
+
+      - name: Upload Max master and raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-max-build
+          path: |
+            ${{ runner.temp }}/mm/work/AIWSMM0005-apfs.dmg
+            ${{ runner.temp }}/mm/work/AIWSMM0005.raw.zip
+            ${{ runner.temp }}/mm/evidence
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-max-evidence
+          path: ${{ runner.temp }}/mm/evidence
+          if-no-files-found: warn
