@@ -1,0 +1,154 @@
+name: mm-arm-apfs-master
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PRIVATE_REPO: ruide92/aiws-mac-arm-free-validation-20261026
+  RELEASE_TAG: arm64-free-validation-20261026
+  DMG_NAME: arm64.dmg
+  EXPECTED_SHA256: 852ddacab39f322345d049c36e1e4b299cee409d8c94305e3bdcd6eb6b3413d5
+  VOLUME_NAME: AIWSMM0004
+  IMAGE_SIZE: 8g
+
+jobs:
+  master:
+    name: Build verified APFS master
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Require Apple Silicon
+        run: |
+          set -euxo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sysctl -n machdep.cpu.brand_string
+
+      - name: Checkout docs
+        uses: actions/checkout@v4
+
+      - name: Download official arm64 payload
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_ASSET_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/mm"
+          gh release download "$RELEASE_TAG" --repo "$PRIVATE_REPO" \
+            --pattern "$DMG_NAME" --dir "$RUNNER_TEMP/mm" --clobber
+          actual=$(shasum -a 256 "$RUNNER_TEMP/mm/$DMG_NAME" | awk '{print $1}')
+          test "$actual" = "$EXPECTED_SHA256"
+          echo "payload_sha256=$actual" | tee "$RUNNER_TEMP/mm/payload.txt"
+
+      - name: Create APFS image and copy complete apps
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/mm"
+          hdiutil create -size "$IMAGE_SIZE" -fs APFS -volname "$VOLUME_NAME" \
+            -type SPARSE "$VOLUME_NAME"
+          hdiutil attach "$VOLUME_NAME.sparseimage" -nobrowse -mountpoint "$RUNNER_TEMP/mm/apfs"
+          mkdir -p "$RUNNER_TEMP/mm/volume"
+          hdiutil attach "$DMG_NAME" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/volume"
+          test -d "$RUNNER_TEMP/mm/volume/Hermes Agent.app"
+          test -d "$RUNNER_TEMP/mm/volume/DeepSeek Harness.app"
+          ditto "$RUNNER_TEMP/mm/volume/Hermes Agent.app" "$RUNNER_TEMP/mm/apfs/Hermes Agent.app"
+          ditto "$RUNNER_TEMP/mm/volume/DeepSeek Harness.app" "$RUNNER_TEMP/mm/apfs/DeepSeek Harness.app"
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/apfs/Hermes Agent.app" || true
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/mm/apfs/DeepSeek Harness.app" || true
+          cp "$GITHUB_WORKSPACE/product/Mac/开始使用.html" "$RUNNER_TEMP/mm/apfs/开始使用.html"
+          cp "$GITHUB_WORKSPACE/product/Mac/先看这里.txt" "$RUNNER_TEMP/mm/apfs/先看这里.txt"
+          {
+            echo "产品: AIWS MM Apple Silicon 官方双应用版"
+            echo "版本: 2610.14"
+            echo "卷标: $VOLUME_NAME"
+            echo "构建时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "payload_sha256: $EXPECTED_SHA256"
+            echo "应用: Hermes Agent.app, DeepSeek Harness.app"
+          } > "$RUNNER_TEMP/mm/apfs/版本信息.txt"
+          sync
+          hdiutil detach "$RUNNER_TEMP/mm/volume"
+          echo "APFS_USED=$(du -sh "$RUNNER_TEMP/mm/apfs" | awk '{print $1}')"
+
+      - name: Verify APFS layout, links and signatures
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/mm/apfs"
+          apps=$(find . -maxdepth 1 -name '*.app' -type d | wc -l | tr -d ' ')
+          test "$apps" = 2
+          test -d 'Hermes Agent.app'
+          test -d 'DeepSeek Harness.app'
+          test -f '开始使用.html'
+          test -f '先看这里.txt'
+          test ! -e 'AI工作站.app'
+          test ! -e 'Mac'
+          test ! -e '程序'
+          for app in 'Hermes Agent.app' 'DeepSeek Harness.app'; do
+            echo "== $app =="
+            codesign --verify --deep --strict --verbose=2 "$app"
+            spctl --assess --type execute --verbose=2 "$app" || true
+            file "$app/Contents/MacOS/"* | tee -a "$RUNNER_TEMP/mm/apfs-verify.txt"
+            symlinks=$(find "$app" -type l | wc -l | tr -d ' ')
+            broken=$(find "$app" -type l ! -exec test -e {} \; -print | wc -l | tr -d ' ')
+            echo "$app symlinks=$symlinks broken=$broken" | tee -a "$RUNNER_TEMP/mm/apfs-verify.txt"
+            test "$broken" = 0
+          done
+          find . -maxdepth 2 -mindepth 1 | sort | tee "$RUNNER_TEMP/mm/apfs-layout.txt"
+          echo "APFS_LAYOUT=PASS" | tee -a "$RUNNER_TEMP/mm/apfs-verify.txt"
+
+      - name: Detach and compress APFS image
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/mm"
+          # No app process was started in this build. A normal detach must succeed;
+          # a forced detach is not used because it can hide a busy-volume defect.
+          hdiutil detach "$RUNNER_TEMP/mm/apfs"
+          test ! -d "$RUNNER_TEMP/mm/apfs"
+          /usr/bin/time -p hdiutil convert "$VOLUME_NAME.sparseimage" \
+            -format UDZO -imagekey zlib-level=1 \
+            -o "$VOLUME_NAME-apfs" -ov
+          hdiutil verify "$VOLUME_NAME-apfs.dmg"
+          shasum -a 256 "$VOLUME_NAME-apfs.dmg" | tee "$RUNNER_TEMP/mm/apfs-image.sha256"
+          ls -lh "$VOLUME_NAME-apfs.dmg" | tee -a "$RUNNER_TEMP/mm/apfs-verify.txt"
+
+      - name: Re-mount master and re-verify
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/mm"
+          hdiutil attach "$VOLUME_NAME-apfs.dmg" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/mm/master"
+          apps=$(find "$RUNNER_TEMP/mm/master" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d ' ')
+          test "$apps" = 2
+          test -f "$RUNNER_TEMP/mm/master/开始使用.html"
+          test -f "$RUNNER_TEMP/mm/master/先看这里.txt"
+          test ! -e "$RUNNER_TEMP/mm/master/AI工作站.app"
+          for app in "$RUNNER_TEMP/mm/master/Hermes Agent.app" "$RUNNER_TEMP/mm/master/DeepSeek Harness.app"; do
+            codesign --verify --deep --strict --verbose=2 "$app"
+            broken=$(find "$app" -type l ! -exec test -e {} \; -print | wc -l | tr -d ' ')
+            test "$broken" = 0
+          done
+          echo "MASTER_REVERIFY=PASS" | tee -a "$RUNNER_TEMP/mm/apfs-verify.txt"
+          hdiutil detach "$RUNNER_TEMP/mm/master"
+
+      - name: Upload APFS master and docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-apfs-master
+          path: |
+            ${{ runner.temp }}/mm/AIWSMM0004-apfs.dmg
+            ${{ runner.temp }}/mm/apfs-image.sha256
+            ${{ runner.temp }}/mm/apfs-layout.txt
+            ${{ runner.temp }}/mm/apfs-verify.txt
+          if-no-files-found: error
+
+      - name: Upload master evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-arm-apfs-master-evidence
+          path: |
+            ${{ runner.temp }}/mm/apfs-verify.txt
+            ${{ runner.temp }}/mm/apfs-layout.txt
+            ${{ runner.temp }}/mm/apfs-image.sha256
+            ${{ runner.temp }}/mm/payload.txt
+          if-no-files-found: warn
